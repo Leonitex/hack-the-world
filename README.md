@@ -37,7 +37,19 @@ The project is being designed to use Meta AI tooling where it materially improve
 
 ## Status
 
-**Foundation phase:** scope and architecture are being established before implementation begins.
+**Milestone 1:** the provider-independent diagnostic core and mandatory verification
+gates are implemented. Meta integration and the model loop are planned for Milestone 2.
+
+With Python 3.11+ installed, run locally from the repository root (no dependencies
+or network required):
+
+```powershell
+python -m unittest discover -s tests -v
+python -m examples.no_display
+```
+
+See [`docs/diagnostic-core.md`](docs/diagnostic-core.md) for the action contracts,
+state transitions, verification rules, and limitations.
 
 ## Team
 
