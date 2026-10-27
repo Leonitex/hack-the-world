@@ -58,6 +58,20 @@ list/tuple of distinct, nonblank questions. `resolutions` is a mapping from a
 contradicting evidence ID to a later supporting evidence ID; use `{}` when none
 are being resolved. `rationale` explains the assessment and any resolutions.
 
+`contracts.py` separates the field definitions into two exposure classes:
+
+- `MODEL_ACTION_FIELDS`: `propose_hypothesis`, `update_hypothesis`,
+  `request_diagnostic_test`, `request_user_evidence`, and `submit_recommendation`.
+- `TRUSTED_INGESTION_ACTION_FIELDS`: `record_evidence`, `record_test_result`,
+  and `provide_user_evidence`.
+
+Future adapters must enumerate only `MODEL_ACTION_FIELDS` for model tools.
+The combined `ACTION_FIELDS` is derived from these groups for the existing
+application API and argument validator. An import-time guard rejects overlapping
+groups; deriving the combined vocabulary leaves no action unclassified. This
+enforces the classification, not caller authentication: `execute()` remains the
+trusted application entry point and accepts both classes with unchanged validation.
+
 Future adapters must distinguish proposals from observations: the model may ask
 for a test or propose an assessment, but trusted application code must obtain the
 real user/tool result before invoking an evidence-writing action. The core checks

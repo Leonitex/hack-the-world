@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from diagnostic_core import DiagnosticSession, Rejected
+from diagnostic_core.contracts import ACTION_FIELDS, MODEL_ACTION_FIELDS, TRUSTED_INGESTION_ACTION_FIELDS
 from diagnostic_core.models import HypothesisStatus as H, SessionStatus as S
 
 
@@ -60,6 +61,46 @@ class CoreTests(unittest.TestCase):
         self.assertEqual((state.turn_count, state.completion_attempts), (0, 0))
         self.assertEqual((state.evidence, state.hypotheses), ((), ()))
         self.assertNotEqual(state.id, DiagnosticSession(PROBLEM).snapshot.id)
+
+    def test_model_action_enumeration_excludes_trusted_ingestion(self):
+        self.assertEqual(set(MODEL_ACTION_FIELDS), {
+            "propose_hypothesis", "update_hypothesis", "request_diagnostic_test",
+            "request_user_evidence", "submit_recommendation",
+        })
+        for action in ("record_evidence", "record_test_result", "provide_user_evidence"):
+            with self.subTest(action=action):
+                self.assertNotIn(action, MODEL_ACTION_FIELDS)
+
+    def test_action_exposure_groups_do_not_overlap(self):
+        self.assertTrue(MODEL_ACTION_FIELDS.keys().isdisjoint(TRUSTED_INGESTION_ACTION_FIELDS))
+
+    def test_every_action_has_exactly_one_exposure_class(self):
+        self.assertEqual(set(ACTION_FIELDS), set(MODEL_ACTION_FIELDS) | set(TRUSTED_INGESTION_ACTION_FIELDS))
+        for action in ACTION_FIELDS:
+            with self.subTest(action=action):
+                self.assertEqual(
+                    int(action in MODEL_ACTION_FIELDS) + int(action in TRUSTED_INGESTION_ACTION_FIELDS), 1,
+                )
+
+    def test_trusted_ingestion_actions_remain_valid_through_application_api(self):
+        self.assertEqual(set(TRUSTED_INGESTION_ACTION_FIELDS), {
+            "record_evidence", "record_test_result", "provide_user_evidence",
+        })
+        initial = self.evidence("Initial user observation")
+        test_request = self.request("request_diagnostic_test")
+        test_result = self.core.execute("record_test_result", {
+            "request_id": test_request, "statement": "Display appeared",
+            "provenance": {"performed_by": "user"},
+        })
+        user_request = self.request()
+        user_result = self.respond(user_request)
+        self.assertEqual([e.id for e in user_result.session.evidence], [
+            initial, test_result.record_id, user_result.record_id,
+        ])
+        self.assertEqual([e.source for e in user_result.session.evidence], [
+            "user_text", "diagnostic_test", "user_text",
+        ])
+        self.assertEqual(user_result.session.status, S.INVESTIGATING)
 
     def test_invalid_session_configuration(self):
         for problem in ("", " ", None, 5):

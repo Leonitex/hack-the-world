@@ -1,6 +1,7 @@
 """Small action vocabulary. No action accepts replacement session state.
 
-Fields map to simple validators, usable by a later provider schema adapter.
+Fields map to simple validators. Future provider adapters must enumerate only
+MODEL_ACTION_FIELDS when exposing model tools, never the combined ACTION_FIELDS.
 Evidence-writing actions must be dispatched by trusted application code using
 the actual user/tool result, never a model's invented observation.
 """
@@ -8,8 +9,7 @@ the actual user/tool result, never a model's invented observation.
 from .models import Rejected
 
 
-ACTION_FIELDS = {
-    "record_evidence": {"source": "text", "statement": "text", "provenance": "metadata"},
+MODEL_ACTION_FIELDS = {
     "propose_hypothesis": {"cause": "text"},
     "update_hypothesis": {
         "hypothesis_id": "text", "status": "text", "supporting": "refs",
@@ -17,17 +17,28 @@ ACTION_FIELDS = {
     },
     "request_diagnostic_test": {"action": "text", "observations": "observations"},
     "request_user_evidence": {"action": "text", "observations": "observations"},
+    "submit_recommendation": {
+        "hypothesis_id": "text", "action": "text", "evidence_ids": "refs",
+        "acknowledged_contradictions": "refs",
+    },
+}
+
+TRUSTED_INGESTION_ACTION_FIELDS = {
+    "record_evidence": {"source": "text", "statement": "text", "provenance": "metadata"},
     "record_test_result": {
         "request_id": "text", "statement": "text", "provenance": "metadata",
     },
     "provide_user_evidence": {
         "request_id": "text", "source": "text", "statement": "text", "provenance": "metadata",
     },
-    "submit_recommendation": {
-        "hypothesis_id": "text", "action": "text", "evidence_ids": "refs",
-        "acknowledged_contradictions": "refs",
-    },
 }
+
+if MODEL_ACTION_FIELDS.keys() & TRUSTED_INGESTION_ACTION_FIELDS.keys():
+    raise ValueError("Actions must belong to exactly one exposure class")
+
+# The application API validates both classes; model tool enumeration uses only
+# MODEL_ACTION_FIELDS. Derivation ensures no action is left unclassified.
+ACTION_FIELDS = {**MODEL_ACTION_FIELDS, **TRUSTED_INGESTION_ACTION_FIELDS}
 
 
 def is_text(value):
