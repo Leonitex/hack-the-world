@@ -28,7 +28,30 @@ Rules:
 7. Use the exact hypothesis and evidence IDs present in the session.
 8. Keep user-facing requested tests short and practical.
 9. Do not claim certainty that the recorded evidence does not support.
+10. Never recommend from the initial complaint alone; obtain at least one follow-up observation or diagnostic test result.
+11. A supplied image is context for choosing better questions/tests, not permission to invent evidence. If a visible detail matters, ask the user to confirm it.
 """
+
+
+def _phase_hint(session) -> str:
+    evidence_count = len(session.evidence)
+    hypotheses = list(session.hypotheses)
+    supported = [h for h in hypotheses if str(h.status) in {"supported", "confirmed"}]
+    reassessed = [h for h in hypotheses if str(h.status) != "possible"]
+
+    if not hypotheses:
+        return "Phase guidance: propose the first plausible hypothesis."
+    if len(hypotheses) < 2 and evidence_count <= 1:
+        return "Phase guidance: propose one additional competing hypothesis."
+    if evidence_count <= 1:
+        return "Phase guidance: request one high-information diagnostic test or user observation."
+    if not reassessed:
+        return "Phase guidance: reassess an existing hypothesis using the new evidence before asking another test."
+    if supported and evidence_count >= 3:
+        return "Phase guidance: if the evidence is sufficient, submit a grounded recommendation; otherwise verify once more."
+    if supported:
+        return "Phase guidance: request one verification step before recommending."
+    return "Phase guidance: update another hypothesis or request the next most discriminating test."
 
 
 class BasetenMuseProvider(Provider):
@@ -52,10 +75,7 @@ class BasetenMuseProvider(Provider):
         self._timeout = timeout
 
     def decide(self, request):
-        tools = [
-            {"type": "function", "function": tool}
-            for tool in request.tools
-        ]
+        tools = [{"type": "function", "function": tool} for tool in request.tools]
 
         state_json = json.dumps(asdict(request.session), indent=2, default=str)
         feedback_json = json.dumps(
@@ -66,6 +86,7 @@ class BasetenMuseProvider(Provider):
 
         instruction = (
             "Choose the single best next diagnostic action.\n\n"
+            f"{_phase_hint(request.session)}\n\n"
             f"Problem:\n{request.problem}\n\n"
             f"Authoritative session state:\n{state_json}\n\n"
             f"Recent execution feedback:\n{feedback_json}\n\n"
