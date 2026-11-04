@@ -1,6 +1,7 @@
-# Final Sprint Status (M3 / M4 / M5)
+# Final Sprint Status (M3–M6)
 
 Branch: `work/final-hackathon-sprint`, based on `origin/work/phone-mvp`.
+Follow-up branch: `work/final-polish-followup` (issue #6: M6A/M6B/M6C).
 Trust core preserved: `diagnostic_core/` and the `AgentLoop` validation
 architecture are unchanged from the Milestone 2A checkpoint. All pre-existing
 Milestone 1/2 tests still pass.
@@ -93,3 +94,88 @@ recording per `docs/demo-plan.md`.
 Blockers: none in code. Live Meta tool-loop compatibility is still
 unverified (Baseten is the reliable demo default); `gh` CLI is not
 installed, so the PR is opened via the web UI.
+
+## M6A — Fix follow-up progress (issue #6 P0): DONE (code + tests; live proof manual)
+
+Root cause confirmed by test repro: `AgentLoop` kept a lifetime
+`max_provider_steps=14`, so `/resume` + `run()` on the same loop
+returned `BUDGET_EXHAUSTED` with zero new provider calls (the failing
+test showed "14 not greater than 14"). The page then rendered
+hypotheses with no next action — the reported stall.
+
+Fix: each `run()` call gets a bounded `max_advance_steps` allowance
+within a session-wide `max_provider_steps` cap (app: 14 per round, 60
+total). Spending one advance returns recoverable `ADVANCE_EXHAUSTED`;
+spending the session cap returns `BUDGET_EXHAUSTED`. `/retry` reuses the
+same loop, so feedback and spend carry over and retries cannot bill
+forever. `LoopResult.advance_steps` reports per-round steps; the UI
+shows outcome + round/total steps + a "New evidence recorded →
+reassessed" note after every resume.
+
+Meta zero-tool replies: `MetaProvider.decide()` now retries text-only
+replies against a bounded reinstruction (default 2 retries, with the
+last `finish_reason` in the diagnostic) and raises `ProviderError`
+instead of returning an empty decision that burned loop steps. Plain
+text is never executed or stored as evidence.
+
+Tests: 147 total green (+4 loop, +3 meta, +4 app), including resume
+after a fully spent advance, 2nd/3rd user turns, structural-error
+double-cap accounting, persistent text-only boundedness, same-session
+retry, and session-cap start-over guidance.
+
+## M6B — Premium technician UX (issue #6 P1): DONE (code + tests; browser/device acceptance manual)
+
+Single-file redesign, no new dependencies or external assets: inline
+SVG orb (layered plasma core, segmented arcs, orbiting scan markers,
+particles, energy sweep, red error core) with
+idle/listening/thinking/speaking/error states on GPU-friendly
+transforms; desktop 3-zone layout (timeline / assistant / technical)
+collapsing to one mobile flow; a real conversation timeline derived
+only from snapshot diffs + user inputs (session start, evidence,
+causes, status changes, test requests, verified recommendation — each
+quoting a real record id); voice controls (Hear/Stop/Hands-free, mic
+permission indicator, dictation fallback); one prominent next action;
+double-submit guard with Working state; draft preservation on
+start/resume errors; error-card keyboard focus;
+`prefers-reduced-motion` support; `aria-live` announcements kept.
+
+Tests: 151 total green (+4 app: timeline lineage, assistant hooks,
+draft preservation ×2). JS passes `node --check`; real HTTP smoke
+`GET / → 200` with orb + hero verified on port 8123.
+
+## M6C — True acceptance (issue #6): BLOCKED live, manual steps pending
+
+Automated gates green: 151 tests, `compileall` clean,
+`git diff --check` clean, `diagnostic_core/` untouched.
+
+Live Meta 2–3-turn smoke: BLOCKED from this shell — no `MODEL_API_KEY`
+/ `META_MODEL_API_KEY` is inherited here and no `.env` file exists, so
+no live call was made and none is claimed. Run in the window where the
+key is already set (never print it):
+
+```powershell
+cd C:\Users\Scott\hack-the-world
+git checkout work/final-polish-followup
+.\.venv\Scripts\Activate.ps1
+python live_m6c_smoke.py
+```
+
+Bounded: 18 steps total, 6 fresh steps per round, 30s Meta timeout.
+Prompt 1 defaults to the issue's suggested result (labeled); prompt 2
+is optional. The script prints PASS/FAIL per round, including "real new
+model decision after Submit" — the issue #6 acceptance gate.
+
+App launch for the manual browser test:
+
+```powershell
+cd C:\Users\Scott\hack-the-world
+git checkout work/final-polish-followup
+.\.venv\Scripts\Activate.ps1
+python phone_app.py
+# open http://127.0.0.1:8000 (MODEL_API_KEY already set in that window)
+```
+
+Still needs a human: the live smoke above; read-aloud, mic
+permission/text fallback, photo upload, and error/retry recovery on
+desktop Chrome/Edge; a Samsung A17 orb/layout check; the three-minute
+demo recording.
