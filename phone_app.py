@@ -12,12 +12,14 @@ from agent.loop import AgentLoop, LoopOutcome
 from agent.providers import ProviderError
 from diagnostic_core.engine import DiagnosticSession
 from diagnostic_core.models import Rejected
+from history_store import HistoryStore
 
 app = Flask(__name__)
 
 STATE = {"loop": None, "last_result": None, "error": None, "provider": None,
          "provider_label": None, "images": {}, "advance_note": None,
-         "timeline": [], "draft_problem": "", "draft_answer": ""}
+         "timeline": [], "draft_problem": "", "draft_answer": "",
+         "history_session_id": None}
 
 # Per-round decision allowance vs session-wide billed-step cap. Each user
 # result grants a fresh advance; the session cap keeps retries bounded.
@@ -27,6 +29,17 @@ SESSION_STEP_BUDGET = 60
 # Factual timeline entries are derived only from real snapshot diffs and
 # real user inputs; the UI never invents conversation history.
 TIMELINE_LIMIT = 60
+
+_STORE = None
+
+
+def get_store():
+    """Process-wide history store, created lazily so imports stay side-effect free."""
+    global _STORE
+    if _STORE is None:
+        default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "history.db")
+        _STORE = HistoryStore(os.environ.get("HTW_HISTORY_DB", default))
+    return _STORE
 
 PAGE = r"""
 <!doctype html>
@@ -127,6 +140,13 @@ details[open] summary { margin-bottom:12px; }
 .fab { position:fixed; right:18px; bottom:18px; width:60px; height:60px; border-radius:50%; padding:0; display:grid; place-items:center; font-size:12px; font-weight:800; letter-spacing:1px; box-shadow:0 12px 32px rgba(0,0,0,.4); }
 .big-action { font-size:19px; line-height:1.45; }
 @media (max-width:520px) { main { padding-left:14px; padding-right:14px; } .orb-wrap { width:212px; height:212px; } .orb-sweep { width:168px; height:168px; } .composer-row { grid-template-columns:1fr; } button { width:100%; } .progress { gap:3px; } .step { font-size:9px; } }
+.sessions { list-style:none; margin:0; padding:0; }
+.sessions li { padding:8px 0; border-top:1px solid #1c2c40; }
+.sessions li:first-child { border-top:0; padding-top:0; }
+.sessions a { color:var(--accent); font-weight:700; text-decoration:none; }
+input[type=text] { width:100%; border-radius:12px; padding:10px 12px; background:#09111a; color:#fff; border:1px solid #2b3e52; font:inherit; }
+.rename-row { display:flex; gap:8px; margin-top:8px; }
+.rename-row button { white-space:nowrap; }
 @media (prefers-reduced-motion:reduce) { .orb-svg *, .orb-sweep, .card { animation:none !important; } .orb-core { transition:none; } }
 </style>
 </head>
@@ -138,14 +158,19 @@ details[open] summary { margin-bottom:12px; }
 <div class="controls"><button type="button" class="secondary" id="speakButton" onclick="speakCurrent()">Hear instruction</button><button type="button" class="secondary" id="stopButton" onclick="stopSpeech()">Stop</button><button type="button" class="secondary" id="handsFreeButton" onclick="toggleHandsFree()">Hands-free: off</button></div>
 <div class="voice-note" id="voiceSupport" role="status"></div>
 </div></div>{% endmacro %}
+{% macro session_list(title) %}<h2>{{ title }}</h2><ul class="sessions">{% for s in sessions %}<li><a href="{{ url_for('view_history', session_id=s.id) }}">{{ s.name }}</a> <span class="badge">{% if s.archived %}archived{% else %}live{% endif %}</span><div class="muted">{{ s.updated_at[:16].replace("T", " ") }} UTC</div></li>{% endfor %}</ul>{% endmacro %}
 <main>
 <header class="top"><div class="brand">Hack the World<small>Evidence-driven field diagnostics</small></div><div class="meta">{{ provider_label or "Meta Muse" }}</div></header>
 {% if error %}<div class="strip"><div class="card error" id="errorCard" tabindex="-1"><strong>Something needs attention</strong><div>{{ error }}</div></div></div>{% endif %}
 {% if advance_note %}<div class="strip"><div class="card next">{{ advance_note }}</div></div>{% endif %}
 {% if result and (result.outcome.value == "provider_error" or result.outcome.value == "advance_exhausted") %}<div class="strip"><form method="post" action="{{ url_for('retry') }}"><button type="submit" class="secondary" style="width:100%">Try again</button></form></div>{% endif %}
-{% if not session %}
+{% if viewing %}
+<div class="strip"><div class="card"><h2>{{ viewing.session.name }}</h2><div class="badges"><span class="badge">{% if viewing.session.archived %}archived · read-only{% else %}live{% endif %}</span><span class="badge">{{ viewing.events|length }} events</span></div><div class="muted">{{ viewing.session.problem }}</div><form method="post" action="{{ url_for('rename_history', session_id=viewing.session.id) }}"><div class="rename-row"><input type="text" name="name" value="{{ viewing.session.name }}" maxlength="80" aria-label="Session name"><button type="submit" class="secondary">Rename</button></div></form><div style="margin-top:10px"><a href="{{ url_for('index') }}">{% if session %}Back to live investigation{% else %}Back{% endif %}</a></div></div></div>
+<div class="strip"><div class="card"><h2>Timeline</h2>{% if viewing.events %}<ol class="timeline">{% for entry in viewing.events %}<li class="t-event"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>#{{ entry.seq }} · {{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div><div class="muted">{{ entry.created_at[:16].replace("T", " ") }} UTC</div></div></li>{% endfor %}</ol>{% else %}<div class="muted">No events recorded yet.</div>{% endif %}</div></div>
+{% elif not session %}
 <div class="strip">{{ assistant_hero() }}</div>
 <div class="strip"><div class="card"><form id="startForm" method="post" action="{{ url_for('start') }}" enctype="multipart/form-data"><h2>Start an investigation</h2><label>Describe the problem</label><textarea id="problemInput" name="problem" required placeholder="Example: Laptop powers on, fan spins, but the screen stays black.">{{ draft_problem }}</textarea><div class="controls" style="margin:10px 0 4px"><button type="button" class="secondary" onclick="startDictation('problemInput', this)">Speak symptoms</button><button type="button" class="secondary" onclick="document.getElementById('imageInput').click()">Add photo</button></div><div class="filebox"><input id="imageInput" type="file" name="image" accept="image/*" capture="environment"><small>A clear device photo is optional, but makes the demo visibly multimodal.</small></div><button type="submit" style="width:100%;margin-top:12px">Begin investigation</button></form></div></div>
+{% if sessions %}<div class="strip"><div class="card">{{ session_list("Previous investigations") }}</div></div>{% endif %}
 {% else %}
 <div class="layout">
 <section class="zone-assistant" aria-label="Assistant">
@@ -155,7 +180,7 @@ details[open] summary { margin-bottom:12px; }
 {% if session.recommendation %}<div class="card final"><h2>Verified recommendation</h2><p class="big-action">{{ session.recommendation.action }}</p><small>Grounded in {{ session.recommendation.evidence_ids|length }} recorded evidence item(s).</small></div>{% endif %}
 <form method="post" action="{{ url_for('reset') }}"><button type="submit" class="secondary" style="width:100%">Start a new investigation</button></form>
 </section>
-{% if timeline %}<section class="zone-timeline" aria-label="Investigation timeline"><div class="card sticky"><h2>Timeline</h2><ol class="timeline">{% for entry in timeline %}<li class="t-event"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>{{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div></div></li>{% endfor %}</ol></div></section>{% endif %}
+<section class="zone-timeline" aria-label="Investigation history">{% if sessions %}<div class="card sticky">{{ session_list("Investigations") }}</div>{% endif %}{% if timeline %}<div class="card"><h2>Timeline</h2><ol class="timeline">{% for entry in timeline %}<li class="t-event"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>{{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div></div></li>{% endfor %}</ol></div>{% endif %}</section>
 <section class="zone-tech" aria-label="Technical details"><div class="card sticky"><details><summary>Evidence & technical details</summary><h3>Evidence</h3>{% if session.evidence %}<div class="evidence-grid">{% for e in session.evidence %}<details class="evidence-chip"><summary><strong>{{ e.id.split(':')[-1] }}</strong> · {{ e.statement }}</summary><div class="muted">Source: {{ e.source }}</div>{% for pair in e.provenance %}<div class="muted">{{ pair[0] }}: {{ pair[1] }}</div>{% endfor %}</details>{% endfor %}</div>{% else %}<div class="muted">No evidence recorded yet.</div>{% endif %}<h3>Competing hypotheses</h3>{% if session.hypotheses %}{% for h in session.hypotheses %}<div class="hypothesis"><strong>{{ h.cause }}</strong><div class="badges"><span class="badge">{{ h.status }}</span></div>{% if h.rationale %}<small>{{ h.rationale }}</small>{% endif %}</div>{% endfor %}{% else %}<div class="muted">No cause proposed yet.</div>{% endif %}</details></div></section>
 </div>
 {% endif %}
@@ -236,41 +261,58 @@ def _record_error(exc):
     STATE["error"] = _friendly_error(exc)
 
 
+def _append_entry(kind, glyph, title, detail, record=None):
+    """Append one timeline entry to memory and to durable history."""
+    STATE["timeline"].append(
+        {"glyph": glyph, "kind": kind, "title": title, "detail": detail, "record": record})
+    hid = STATE["history_session_id"]
+    if hid is not None:
+        get_store().record_event(hid, kind, glyph, title, detail, record)
+
+
 def _record_timeline(before, after, user_text=None):
     """Append factual entries derived from real snapshot diffs.
 
     `before` is None only for a fresh session start. Every entry quotes a
     real record id, user input, or model action; nothing is invented.
     """
-    log = STATE["timeline"]
     if user_text is not None:
-        log.append({"glyph": "◉", "title": "You reported", "detail": user_text})
+        _append_entry("user", "◉", "You reported", user_text)
     old_evidence = {item.id for item in before.evidence} if before is not None else set()
     old_status = {item.id: item.status for item in before.hypotheses} if before is not None else {}
     if before is None:
-        log.append({"glyph": "●", "title": "Session started", "detail": after.problem})
+        _append_entry("session", "●", "Session started", after.problem)
     else:
         for item in after.evidence:
             if item.id not in old_evidence:
-                log.append({"glyph": "▣", "title": f"Evidence recorded ({item.id})", "detail": item.statement})
+                _append_entry("evidence", "▣", f"Evidence recorded ({item.id})", item.statement, item.id)
     for hypo in after.hypotheses:
         if hypo.id not in old_status:
-            log.append({"glyph": "◇", "title": f"New cause considered ({hypo.id})", "detail": hypo.cause})
+            _append_entry("hypothesis", "◇", f"New cause considered ({hypo.id})", hypo.cause, hypo.id)
         elif hypo.status != old_status[hypo.id]:
-            log.append({"glyph": "↻", "title": f"Cause {hypo.id} is now {hypo.status}", "detail": hypo.rationale or hypo.cause})
+            _append_entry("update", "↻", f"Cause {hypo.id} is now {hypo.status}",
+                          hypo.rationale or hypo.cause, hypo.id)
     upcoming = after.next_action
     if upcoming is not None and (
         before is None or before.next_action is None or before.next_action.id != upcoming.id
     ):
-        log.append({"glyph": "▷", "title": "Test requested", "detail": upcoming.action})
+        _append_entry("test", "▷", "Test requested", upcoming.action, upcoming.id)
     if after.recommendation is not None and (before is None or before.recommendation is None):
-        log.append({"glyph": "✓", "title": "Verified recommendation", "detail": after.recommendation.action})
+        _append_entry("recommendation", "✓", "Verified recommendation",
+                      after.recommendation.action, after.recommendation.hypothesis_id)
+    del STATE["timeline"][:-TIMELINE_LIMIT]
+
+
+def _record_photo_event(record_id):
+    """Note that a photo informed one round. Image bytes are never stored."""
+    _append_entry("photo", "◈", f"Photo attached ({record_id})",
+                  "Shown to the model for this round; image bytes are not stored.", record_id)
     del STATE["timeline"][:-TIMELINE_LIMIT]
 
 
 def current_context():
     loop = STATE["loop"]
-    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"], "provider_label": STATE["provider_label"], "advance_note": STATE["advance_note"], "timeline": STATE["timeline"], "draft_problem": STATE["draft_problem"], "draft_answer": STATE["draft_answer"]}
+    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"], "provider_label": STATE["provider_label"], "advance_note": STATE["advance_note"], "timeline": STATE["timeline"], "draft_problem": STATE["draft_problem"], "draft_answer": STATE["draft_answer"], "sessions": get_store().list_sessions(), "viewing": None}
 
 
 @app.get("/")
@@ -314,12 +356,21 @@ def start():
         STATE["advance_note"] = None
         STATE["timeline"] = []
         STATE["draft_problem"] = ""
+        previous = STATE["history_session_id"]
+        if previous is not None:
+            get_store().archive_session(previous)
+        hid = loop.session.snapshot.id
+        count = len(get_store().list_sessions()) + 1
+        get_store().create_session(hid, f"Investigation {count} — {problem[:36]}", problem)
+        STATE["history_session_id"] = hid
         STATE["provider"] = provider
         STATE["provider_label"] = label
         STATE["images"] = {initial.record_id: image_data_url} if image_data_url else {}
         STATE["last_result"] = loop.run()
         STATE["error"] = _outcome_error(STATE["last_result"])
         _record_timeline(None, loop.session.snapshot)
+        if image_data_url:
+            _record_photo_event(initial.record_id)
     except (ValueError, Rejected, ProviderError) as exc:
         _record_error(exc)
         STATE["draft_problem"] = problem
@@ -361,6 +412,8 @@ def resume():
         )
         STATE["draft_answer"] = ""
         _record_timeline(before, loop.session.snapshot, user_text=answer)
+        if image_data_url:
+            _record_photo_event(ingested.record_id)
     except (ValueError, Rejected, ProviderError) as exc:
         _record_error(exc)
         STATE["draft_answer"] = answer
@@ -396,6 +449,9 @@ def retry():
 
 @app.post("/reset")
 def reset():
+    hid = STATE["history_session_id"]
+    if hid is not None:
+        get_store().archive_session(hid)
     STATE["loop"] = None
     STATE["last_result"] = None
     STATE["error"] = None
@@ -406,7 +462,38 @@ def reset():
     STATE["timeline"] = []
     STATE["draft_problem"] = ""
     STATE["draft_answer"] = ""
+    STATE["history_session_id"] = None
     return redirect(url_for("index"))
+
+
+@app.get("/history/<session_id>")
+def view_history(session_id):
+    session = get_store().get_session(session_id)
+    if session is None:
+        STATE["error"] = "Investigation not found."
+        return redirect(url_for("index"))
+    context = current_context()
+    context["viewing"] = {
+        "session": session, "events": get_store().get_events(session_id)}
+    return render_template_string(PAGE, **context)
+
+
+@app.post("/history/<session_id>/rename")
+def rename_history(session_id):
+    if get_store().get_session(session_id) is None:
+        STATE["error"] = "Investigation not found."
+        return redirect(url_for("index"))
+    name = (request.form.get("name") or "").strip()
+    if not name:
+        STATE["error"] = "Session name must not be empty."
+        return redirect(url_for("view_history", session_id=session_id))
+    try:
+        get_store().rename_session(session_id, name)
+    except ValueError as exc:
+        STATE["error"] = str(exc)
+        return redirect(url_for("view_history", session_id=session_id))
+    STATE["error"] = None
+    return redirect(url_for("view_history", session_id=session_id))
 
 
 if __name__ == "__main__":
