@@ -41,7 +41,7 @@ scope unless separately verified.
 | Skill validation | PASS | 2026-11-04 | `muse skills validate --json`: `valid: true`, zero diagnostics, all 3 skills |
 | E2E spec check | PASS | 2026-11-04 | `node --check` on config + spec; `package.json` + `package-lock.json` (Playwright 1.64.1) parse |
 | CI workflow | PASS (static) | 2026-11-04 | `qa-gates.yml` parses; unit + e2e jobs defined; not yet executed by a runner |
-| Browser E2E | NOT-RUN | 2026-11-04 | No Playwright browsers installed here; run in CI or after `npx playwright install chromium` |
+| Browser E2E | PASS | 2026-11-04 | Run 41934858433: 2 passed (3.8s), Chromium, serial workers, fixture server |
 | Live-model smoke | NOT-RUN | 2026-11-04 | No `MODEL_API_KEY` in automation env; run `live_m6c_smoke.py` in a keyed window |
 | Voice/device manual | NOT-RUN | 2026-11-04 | Requires human + Galaxy A17; never waived silently |
 
@@ -52,6 +52,28 @@ confirmed scope, found 2 High findings, both fixed and re-verified:
 (lockfile generated and pinned). Protected areas (`diagnostic_core/`,
 trust boundary, budgets, provenance) verified untouched; no secrets
 found; E2E selectors cross-checked against templates.
+
+CI run 41928015974 failed on cross-test coupling (test 2 assumed a fresh
+form while the single-session server still held test 1's session). Fixed
+with a shared UI-reset `beforeEach` plus a settle wait — no assertions
+weakened, no fixture changes — and re-verified green in run 41934858433.
+
+## Pending coordination with issue #9
+
+Issue #9 (`work/nonrepeating-diagnosis`, not yet branched as of
+2026-11-04) will add repeat-guard and case-reopen behavior. When it
+lands, extend `tests/e2e/` with:
+
+- `repeat-guard.spec.js`: submit the same observation twice through the
+  UI; assert the second diagnostic test differs from the first and the
+  first instruction remains in the timeline.
+- `reopen-case.spec.js`: start an investigation, leave it unfinished,
+  open it from the history archive, and continue it; assert context
+  (evidence, hypotheses, pending test) is preserved.
+
+Activate these specs only against a server running the #9 features;
+until then this section stays pending and the browser gate covers the
+smoke flow above.
 
 ## Running the automated gates locally
 
