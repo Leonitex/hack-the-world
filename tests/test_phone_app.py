@@ -514,5 +514,24 @@ class PhoneAppTests(unittest.TestCase):
         self.assertIn("line-height:1.5", body)
 
 
+    def test_drawer_desktop_sync_script_present(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn('querySelector(".drawer")', body)
+        self.assertIn("matchMedia", body)
+        self.assertIn("syncDrawer", body)
+        self.assertIn("body.js .drawer>summary", body)
+
+    def test_rename_escapes_html(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        hid = phone_app.STATE["history_session_id"]
+        response = self.client.post(
+            f"/history/{hid}/rename", data={"name": "<script>alert(1)</script>"},
+            follow_redirects=True)
+        body = response.get_data(as_text=True)
+        self.assertNotIn("<script>alert(1)</script>", body)
+        self.assertIn("&lt;script&gt;", body)
+
+
 if __name__ == "__main__":
     unittest.main()
