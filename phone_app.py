@@ -16,7 +16,12 @@ from diagnostic_core.models import Rejected
 app = Flask(__name__)
 
 STATE = {"loop": None, "last_result": None, "error": None, "provider": None,
-         "provider_label": None, "images": {}}
+         "provider_label": None, "images": {}, "advance_note": None}
+
+# Per-round decision allowance vs session-wide billed-step cap. Each user
+# result grants a fresh advance; the session cap keeps retries bounded.
+ADVANCE_STEP_BUDGET = 14
+SESSION_STEP_BUDGET = 60
 
 PAGE = r"""
 <!doctype html>
@@ -105,11 +110,12 @@ details[open] summary { margin-bottom:12px; }
 <div class="voice-note" id="voiceSupport" role="status"></div>
 </section>
 {% if error %}<div class="card error"><strong>Something needs attention</strong><div>{{ error }}</div></div>{% endif %}
-{% if result and (result.outcome.value == "provider_error" or result.outcome.value == "budget_exhausted") %}<form method="post" action="{{ url_for('retry') }}"><button type="submit" class="secondary" style="width:100%">Try again</button></form>{% endif %}
+{% if advance_note %}<div class="card next">{{ advance_note }}</div>{% endif %}
+{% if result and (result.outcome.value == "provider_error" or result.outcome.value == "advance_exhausted") %}<form method="post" action="{{ url_for('retry') }}"><button type="submit" class="secondary" style="width:100%">Try again</button></form>{% endif %}
 {% if not session %}
 <div class="card"><form id="startForm" method="post" action="{{ url_for('start') }}" enctype="multipart/form-data"><label>Describe the problem</label><textarea id="problemInput" name="problem" required placeholder="Example: Laptop powers on, fan spins, but the screen stays black."></textarea><div class="controls" style="margin:10px 0 4px"><button type="button" class="secondary" onclick="startDictation('problemInput', this)">🎙 Speak symptoms</button><button type="button" class="secondary" onclick="document.getElementById('imageInput').click()">📷 Add photo</button></div><div class="filebox"><input id="imageInput" type="file" name="image" accept="image/*" capture="environment"><small>A clear device photo is optional, but makes the demo visibly multimodal.</small></div><button type="submit" style="width:100%;margin-top:12px">Begin investigation</button></form></div>
 {% else %}
-<div class="card"><div class="badges"><span class="badge">{{ session.status }}</span><span class="badge">{{ session.turn_count }} diagnostic turns</span><span class="badge">{{ result.steps_used if result else 0 }} Muse steps</span></div><div class="progress"><div class="step done">Observe</div><div class="step {% if session.hypotheses %}done{% else %}active{% endif %}">Hypothesize</div><div class="step {% if session.next_action %}active{% elif session.recommendation %}done{% endif %}">Test</div><div class="step {% if session.recommendation %}done{% elif session.hypotheses and not session.next_action %}active{% endif %}">Verify</div><div class="step {% if session.recommendation %}active{% endif %}">Fix</div></div><h3 style="margin-top:16px">Device problem</h3><div>{{ session.problem }}</div></div>
+<div class="card"><div class="badges"><span class="badge">{{ session.status }}</span><span class="badge">{{ session.turn_count }} diagnostic turns</span><span class="badge">{{ result.steps_used if result else 0 }} Muse steps</span><span class="badge">{{ result.advance_steps if result else 0 }} steps this round</span><span class="badge">{{ result.outcome.value if result else "started" }}</span></div><div class="progress"><div class="step done">Observe</div><div class="step {% if session.hypotheses %}done{% else %}active{% endif %}">Hypothesize</div><div class="step {% if session.next_action %}active{% elif session.recommendation %}done{% endif %}">Test</div><div class="step {% if session.recommendation %}done{% elif session.hypotheses and not session.next_action %}active{% endif %}">Verify</div><div class="step {% if session.recommendation %}active{% endif %}">Fix</div></div><h3 style="margin-top:16px">Device problem</h3><div>{{ session.problem }}</div></div>
 {% if session.next_action %}<div class="card next"><h2>Do this next</h2><p style="font-size:18px;line-height:1.45"><strong>{{ session.next_action.action }}</strong></p>{% if session.next_action.observations %}<div class="muted">Report:</div><ul>{% for o in session.next_action.observations %}<li>{{ o }}</li>{% endfor %}</ul>{% endif %}<form id="resumeForm" method="post" action="{{ url_for('resume') }}" enctype="multipart/form-data"><label>What happened?</label><textarea id="answerInput" name="answer" required placeholder="Tell me exactly what you observed."></textarea><div class="filebox" style="margin-top:10px"><input id="answerImageInput" type="file" name="image" accept="image/*" capture="environment"><small>Optional follow-up photo of what you observed.</small></div><div class="controls" style="margin:10px 0 0"><button type="button" id="answerMic" class="secondary" onclick="startDictation('answerInput', this)">🎙 Speak result</button><button type="submit">Submit & continue</button></div></form></div>{% endif %}
 {% if session.recommendation %}<div class="card final"><h2>✓ Verified recommendation</h2><p style="font-size:18px;line-height:1.45">{{ session.recommendation.action }}</p><small>Grounded in {{ session.recommendation.evidence_ids|length }} recorded evidence item(s).</small></div>{% endif %}
 <details class="card"><summary>Evidence & technical details</summary><h3>Evidence</h3>{% if session.evidence %}<div class="evidence-grid">{% for e in session.evidence %}<details class="evidence-chip"><summary><strong>{{ e.id.split(':')[-1] }}</strong> · {{ e.statement }}</summary><div class="muted">Source: {{ e.source }}</div>{% for pair in e.provenance %}<div class="muted">{{ pair[0] }}: {{ pair[1] }}</div>{% endfor %}</details>{% endfor %}</div>{% else %}<div class="muted">No evidence recorded yet.</div>{% endif %}<h3 style="margin-top:18px">Competing hypotheses</h3>{% if session.hypotheses %}{% for h in session.hypotheses %}<div class="hypothesis"><strong>{{ h.cause }}</strong><div class="badges"><span class="badge">{{ h.status }}</span></div>{% if h.rationale %}<small>{{ h.rationale }}</small>{% endif %}</div>{% endfor %}{% else %}<div class="muted">No cause proposed yet.</div>{% endif %}</details>
@@ -193,7 +199,7 @@ def _record_error(exc):
 
 def current_context():
     loop = STATE["loop"]
-    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"], "provider_label": STATE["provider_label"]}
+    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"], "provider_label": STATE["provider_label"], "advance_note": STATE["advance_note"]}
 
 
 @app.get("/")
@@ -211,7 +217,9 @@ def _outcome_error(result):
         return f"Diagnosis paused ({result.session.pause_reason}). Start a new investigation to continue."
     if result.outcome is LoopOutcome.PROVIDER_ERROR:
         return "The diagnostic service had trouble reaching the model. You can try again."
-    return "The assistant ran out of steps. You can try again to continue."
+    if result.outcome is LoopOutcome.ADVANCE_EXHAUSTED:
+        return "The assistant paused mid-investigation. You can try again to continue."
+    return "The session used its full step budget. Start a new investigation to continue."
 
 
 @app.post("/start")
@@ -226,8 +234,13 @@ def start():
         session = DiagnosticSession(problem, max_turns=30, max_completion_attempts=3)
         initial = session.execute("record_evidence", {"source": "user_text", "statement": problem, "provenance": {"channel": "phone_ui", "kind": "initial_problem"}})
         provider, label = create_provider(image_data_url)
-        loop = AgentLoop(session, provider, max_provider_steps=14)
+        loop = AgentLoop(
+            session, provider,
+            max_provider_steps=SESSION_STEP_BUDGET,
+            max_advance_steps=ADVANCE_STEP_BUDGET,
+        )
         STATE["loop"] = loop
+        STATE["advance_note"] = None
         STATE["provider"] = provider
         STATE["provider_label"] = label
         STATE["images"] = {initial.record_id: image_data_url} if image_data_url else {}
@@ -256,13 +269,19 @@ def resume():
         return redirect(url_for("index"))
     try:
         image_data_url = image_to_data_url(request.files.get("image"))
-        result = loop.resume_with_result(answer, {"channel": "phone_ui", "kind": "diagnostic_observation"})
+        ingested = loop.resume_with_result(answer, {"channel": "phone_ui", "kind": "diagnostic_observation"})
         if image_data_url:
-            STATE["images"][result.record_id] = image_data_url
+            STATE["images"][ingested.record_id] = image_data_url
             if STATE["provider"] is not None:
                 STATE["provider"].set_image(image_data_url)
         STATE["last_result"] = loop.run()
         STATE["error"] = _outcome_error(STATE["last_result"])
+        advanced = STATE["last_result"]
+        STATE["advance_note"] = (
+            f"New evidence recorded ({ingested.record_id}) → reassessed "
+            f"({advanced.advance_steps} steps this round, "
+            f"{advanced.steps_used} total)."
+        )
     except (ValueError, Rejected, ProviderError) as exc:
         _record_error(exc)
     except Exception:  # noqa: BLE001 - demo surface reports failures inline
@@ -276,14 +295,14 @@ def resume():
 def retry():
     STATE["error"] = None
     loop = STATE["loop"]
-    provider = STATE["provider"]
-    if loop is None or provider is None:
+    if loop is None:
         return redirect(url_for("index"))
     try:
-        fresh = AgentLoop(loop.session, provider, max_provider_steps=14)
-        STATE["loop"] = fresh
-        STATE["last_result"] = fresh.run()
+        # Same loop: feedback and session-wide spend carry over, so a retry
+        # grants one fresh advance instead of unlimited billed steps.
+        STATE["last_result"] = loop.run()
         STATE["error"] = _outcome_error(STATE["last_result"])
+        STATE["advance_note"] = None
     except (ValueError, Rejected, ProviderError) as exc:
         _record_error(exc)
     except Exception:  # noqa: BLE001 - demo surface reports failures inline
@@ -301,6 +320,7 @@ def reset():
     STATE["provider"] = None
     STATE["provider_label"] = None
     STATE["images"] = {}
+    STATE["advance_note"] = None
     return redirect(url_for("index"))
 
 

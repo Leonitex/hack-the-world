@@ -13,6 +13,14 @@ spend authoritative diagnostic budgets (turns or completion attempts),
 while well-shaped semantic failures do. This intentionally differs from
 calling the raw core directly, where even malformed submit_recommendation
 arguments consume a completion attempt.
+
+Provider steps are bounded twice: each run() call may consume at most
+max_advance_steps new steps, while the loop instance may never exceed
+max_provider_steps total. A trusted user result therefore grants a fresh
+bounded allowance on the next run() while billed work stays capped
+session-wide. Spending one advance mid-investigation returns
+ADVANCE_EXHAUSTED, which an explicit same-loop retry may continue;
+spending the session cap returns BUDGET_EXHAUSTED.
 """
 
 from copy import deepcopy
@@ -33,6 +41,7 @@ class LoopOutcome(StrEnum):
     PAUSED = "paused"
     PROVIDER_ERROR = "provider_error"
     BUDGET_EXHAUSTED = "budget_exhausted"
+    ADVANCE_EXHAUSTED = "advance_exhausted"
 
 
 @dataclass(frozen=True)
@@ -41,6 +50,7 @@ class LoopResult:
     session: Session
     steps_used: int
     message: str
+    advance_steps: int = 0
 
 
 class AgentLoop:
@@ -49,18 +59,25 @@ class AgentLoop:
     DEFAULT_MAX_PROVIDER_STEPS = 50
     FEEDBACK_WINDOW = 10
 
-    def __init__(self, session, provider, *, max_provider_steps=DEFAULT_MAX_PROVIDER_STEPS):
+    def __init__(self, session, provider, *, max_provider_steps=DEFAULT_MAX_PROVIDER_STEPS,
+                 max_advance_steps=None):
         if not isinstance(session, DiagnosticSession):
             raise TypeError("AgentLoop requires a DiagnosticSession")
         if not callable(getattr(provider, "decide", None)):
             raise TypeError("Provider must implement decide(request)")
         if type(max_provider_steps) is not int or max_provider_steps < 1:
             raise Rejected("Provider step budget must be a positive integer")
+        if max_advance_steps is None:
+            max_advance_steps = max_provider_steps
+        if type(max_advance_steps) is not int or max_advance_steps < 1:
+            raise Rejected("Advance step budget must be a positive integer")
         self._session = session
         self._provider = provider
         self._max_provider_steps = max_provider_steps
+        self._max_advance_steps = max_advance_steps
         self._feedback = []
         self._steps_used = 0
+        self._run_entry_steps = 0
 
     @property
     def session(self):
@@ -73,6 +90,8 @@ class AgentLoop:
     def run(self):
         """Advance the session until the provider must stop. See LoopOutcome."""
         provider_failed_last = False
+        self._run_entry_steps = self._steps_used
+        advance_cap = self._steps_used + self._max_advance_steps
         while True:
             snapshot = self._session.snapshot
             if snapshot.status is S.COMPLETED:
@@ -96,6 +115,16 @@ class AgentLoop:
                     )
                 return self._result(
                     LoopOutcome.BUDGET_EXHAUSTED, snapshot, "Provider step budget exhausted.",
+                )
+            if self._steps_used >= advance_cap:
+                if provider_failed_last:
+                    return self._result(
+                        LoopOutcome.PROVIDER_ERROR, snapshot,
+                        "Provider failures spent this advance.",
+                    )
+                return self._result(
+                    LoopOutcome.ADVANCE_EXHAUSTED, snapshot,
+                    "Advance allowance spent; an explicit retry may continue.",
                 )
             try:
                 decision = self._provider.decide(self._request(snapshot))
@@ -173,7 +202,8 @@ class AgentLoop:
         return self._session.execute(action, arguments)
 
     def _result(self, outcome, snapshot, message):
-        return LoopResult(outcome, snapshot, self._steps_used, message)
+        advance_steps = self._steps_used - self._run_entry_steps
+        return LoopResult(outcome, snapshot, self._steps_used, message, advance_steps)
 
     def _request(self, snapshot):
         return ProviderRequest(
@@ -184,7 +214,10 @@ class AgentLoop:
             feedback=tuple(self._feedback[-self.FEEDBACK_WINDOW:]),
             turn_count=snapshot.turn_count,
             completion_attempts=snapshot.completion_attempts,
-            remaining_provider_steps=self._max_provider_steps - self._steps_used,
+            remaining_provider_steps=min(
+                self._max_provider_steps - self._steps_used,
+                self._run_entry_steps + self._max_advance_steps - self._steps_used,
+            ),
         )
 
     @staticmethod

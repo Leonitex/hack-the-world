@@ -137,10 +137,10 @@ class MetaProviderTests(unittest.TestCase):
         }).record_id
 
     def test_converts_model_tools_to_openai_function_format(self):
-        client = FakeClient([text_response()])
+        client = FakeClient([tool_response(("propose_hypothesis", {"cause": "Cause A"}))])
         provider = MetaProvider(client=client)
         decision = provider.decide(self.request_for())
-        self.assertEqual(decision, ProviderDecision(()))
+        self.assertEqual(decision.calls[0].name, "propose_hypothesis")
         sent = client.completions.calls[0]
         self.assertEqual(sent["model"], "muse-spark-1.3")
         self.assertEqual(sent["tool_choice"], "auto")
@@ -164,7 +164,7 @@ class MetaProviderTests(unittest.TestCase):
         )
 
     def test_trusted_ingestion_absent_from_outbound_tools(self):
-        client = FakeClient([text_response()])
+        client = FakeClient([tool_response(("propose_hypothesis", {"cause": "Cause A"}))])
         MetaProvider(client=client).decide(self.request_for())
         names = {tool["function"]["name"] for tool in client.completions.calls[0]["tools"]}
         for action in TRUSTED_INGESTION_ACTION_FIELDS:
@@ -187,7 +187,7 @@ class MetaProviderTests(unittest.TestCase):
             self.assertEqual(from_env.base_url, "https://env.invalid/v1")
             explicit_wins = MetaProvider(client=FakeClient([]), model="explicit-model")
             self.assertEqual(explicit_wins.model, "explicit-model")
-        client = FakeClient([text_response()])
+        client = FakeClient([tool_response(("propose_hypothesis", {"cause": "Cause A"}))])
         MetaProvider(client=client, model="custom-model").decide(self.request_for())
         self.assertEqual(client.completions.calls[0]["model"], "custom-model")
 
@@ -197,7 +197,8 @@ class MetaProviderTests(unittest.TestCase):
         class RecordingFactory:
             def __init__(self, **kwargs):
                 built.append(kwargs)
-                self.chat = SimpleNamespace(completions=FakeCompletions([text_response()]))
+                self.chat = SimpleNamespace(completions=FakeCompletions(
+                    [tool_response(("propose_hypothesis", {"cause": "Cause A"}))]))
 
         key = "MODEL_API_KEY-fake-secret-value"
         with patch.dict(os.environ, {"MODEL_API_KEY": key}, clear=True):
@@ -219,7 +220,7 @@ class MetaProviderTests(unittest.TestCase):
 
     def test_api_key_absent_from_rendered_payload(self):
         key = "MODEL_API_KEY-fake-secret-value"
-        client = FakeClient([text_response()])
+        client = FakeClient([tool_response(("propose_hypothesis", {"cause": "Cause A"}))])
         with patch.dict(os.environ, {"MODEL_API_KEY": key}, clear=True):
             MetaProvider(client=client).decide(self.request_for())
         payload = json.dumps(client.completions.calls[0])
@@ -277,19 +278,65 @@ class MetaProviderTests(unittest.TestCase):
                     provider.decide(self.request_for())
         self.assertEqual(self.core.snapshot.turn_count, 0)
 
+    def test_text_only_retries_then_raises_with_diagnostics(self):
+        # Issue #6: Meta may answer with plain text and zero tool calls.
+        # The adapter must reinstruct on a bounded retry, then fail with a
+        # clear diagnostic -- never silently return an empty decision that
+        # burns loop steps without progress.
+        provider = MetaProvider(client=FakeClient(
+            [text_response(), text_response(), text_response()]))
+        with self.assertRaises(ProviderError) as raised:
+            provider.decide(self.request_for())
+        message = str(raised.exception)
+        self.assertIn("no tool call", message)
+        self.assertIn("3 attempts", message)
+        calls = provider._client.completions.calls
+        self.assertEqual(len(calls), 3)
+        for attempt in calls[1:]:
+            contents = [message.get("content", "") for message in attempt["messages"]]
+            self.assertTrue(any("one tool call" in str(content) for content in contents))
+
+    def test_text_only_followed_by_tool_call_recovers(self):
+        provider = MetaProvider(client=FakeClient([
+            text_response(),
+            tool_response(("propose_hypothesis", {"cause": "Cause A"})),
+        ]))
+        decision = provider.decide(self.request_for())
+        self.assertEqual(len(decision.calls), 1)
+        self.assertEqual(decision.calls[0].name, "propose_hypothesis")
+        self.assertEqual(len(provider._client.completions.calls), 2)
+
+    def test_persistent_text_only_through_loop_is_bounded(self):
+        core = DiagnosticSession(PROBLEM)
+        provider = MetaProvider(client=FakeClient([text_response()] * 6))
+        result = AgentLoop(core, provider, max_provider_steps=2).run()
+        self.assertEqual(result.outcome, LoopOutcome.PROVIDER_ERROR)
+        self.assertEqual(len(provider._client.completions.calls), 6)
+        self.assertEqual(core.snapshot.turn_count, 0)
+        self.assertEqual(core.snapshot.hypotheses, ())
+        self.assertEqual(core.snapshot.evidence, ())
+
     def test_zero_calls_safe(self):
+        # This test formerly asserted that a text-only reply becomes an
+        # empty decision. That expectation encoded the issue #6 stall: the
+        # loop burned steps on empty decisions without progress. Text-only
+        # replies now get bounded reinstructed retries, then a clear
+        # ProviderError; no text is ever executed or stored as evidence.
         for response in (text_response(), tool_response()):
             with self.subTest(response=response):
-                core = DiagnosticSession(PROBLEM)
-                provider = MetaProvider(client=FakeClient([response]))
-                self.assertEqual(
-                    provider.decide(self.request_for(core)), ProviderDecision(()),
-                )
+                provider = MetaProvider(
+                    client=FakeClient([response, response, response]))
+                with self.assertRaises(ProviderError) as raised:
+                    provider.decide(self.request_for())
+                self.assertIn("no tool call", str(raised.exception))
+                self.assertEqual(len(provider._client.completions.calls), 3)
         core = DiagnosticSession(PROBLEM)
-        provider = MetaProvider(client=FakeClient([text_response()]))
+        provider = MetaProvider(client=FakeClient([text_response()] * 3))
         result = AgentLoop(core, provider, max_provider_steps=1).run()
-        self.assertEqual(result.outcome, LoopOutcome.BUDGET_EXHAUSTED)
+        self.assertEqual(result.outcome, LoopOutcome.PROVIDER_ERROR)
         self.assertEqual(core.snapshot.turn_count, 0)
+        self.assertEqual(core.snapshot.hypotheses, ())
+        self.assertEqual(core.snapshot.evidence, ())
 
     def test_multiple_calls_safe_none_execute(self):
         provider = MetaProvider(client=FakeClient([tool_response(
@@ -398,7 +445,7 @@ class MetaProviderTests(unittest.TestCase):
             tool="propose_hypothesis", ok=True, message="propose_hypothesis succeeded.",
             record_id=self.core.snapshot.hypotheses[0].id,
         )]
-        client = FakeClient([text_response()])
+        client = FakeClient([tool_response(("propose_hypothesis", {"cause": "Cause A"}))])
         MetaProvider(client=client).decide(self.request_for(feedback=feedback))
         messages = client.completions.calls[0]["messages"]
         self.assertEqual(messages[0]["role"], "developer")
@@ -422,7 +469,7 @@ class MetaProviderTests(unittest.TestCase):
             "action": "Perform the next check and report the outcome.",
             "observations": ["What changed?"],
         })
-        client = FakeClient([text_response()])
+        client = FakeClient([tool_response(("propose_hypothesis", {"cause": "Cause A"}))])
         MetaProvider(client=client).decide(self.request_for())
         user = client.completions.calls[0]["messages"][1]["content"]
         self.assertIn("request_user_evidence", user)
@@ -538,7 +585,7 @@ class MetaProviderTests(unittest.TestCase):
         self.assertNotIn(key, str(raised.exception))
 
     def test_image_included_when_provided(self):
-        client = FakeClient([text_response()])
+        client = FakeClient([tool_response(("propose_hypothesis", {"cause": "Cause A"}))])
         MetaProvider(client=client, image_data_url="data:image/png;base64,AAA").decide(
             self.request_for(),
         )
@@ -548,7 +595,8 @@ class MetaProviderTests(unittest.TestCase):
         self.assertEqual(images[0]["image_url"]["url"], "data:image/png;base64,AAA")
 
     def test_image_absent_by_default_and_set_image_updates(self):
-        client = FakeClient([text_response(), text_response()])
+        reply = tool_response(("propose_hypothesis", {"cause": "Cause A"}))
+        client = FakeClient([reply, reply])
         provider = MetaProvider(client=client)
         provider.decide(self.request_for())
         provider.set_image("data:image/png;base64,BBB")
