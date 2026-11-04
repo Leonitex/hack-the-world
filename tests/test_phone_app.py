@@ -1,7 +1,9 @@
 """Phone app endpoint tests. Providers are faked; no network, no keys."""
 
 import io
+import os
 import socket
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -9,6 +11,7 @@ import phone_app
 from agent.loop import LoopOutcome
 from agent.providers import FakeProvider, ProviderError, ToolCall
 from diagnostic_core.models import SessionStatus as S
+from history_store import HistoryStore
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
 
@@ -43,11 +46,16 @@ class PhoneAppTests(unittest.TestCase):
             guard = patch(target, side_effect=AssertionError("Network access forbidden in app tests"))
             guard.start()
             self.addCleanup(guard.stop)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_store = phone_app._STORE
+        phone_app._STORE = HistoryStore(os.path.join(self._tmp.name, "history.db"))
         self.client = phone_app.app.test_client()
         self.client.post("/reset")
 
     def tearDown(self):
         self.client.post("/reset")
+        phone_app._STORE = self._old_store
 
     def start_session(self, problem="Laptop powers on but has no display", script=None, label="Test Provider"):
         fake = RecordingFake(list(script or []))
@@ -213,6 +221,7 @@ class PhoneAppTests(unittest.TestCase):
         self.assertIsNone(phone_app.STATE["loop"])
         self.assertIsNone(phone_app.STATE["provider"])
         self.assertEqual(phone_app.STATE["images"], {})
+        self.assertIsNone(phone_app.STATE["history_session_id"])
 
 
     def test_resume_continues_after_start_consumes_advance(self):
@@ -341,6 +350,187 @@ class PhoneAppTests(unittest.TestCase):
         loop = phone_app.STATE["loop"]
         self.assertIsNotNone(loop)
         self.assertEqual(loop.session.snapshot.status, S.NEEDS_INPUT)
+
+
+    def test_new_investigation_archives_previous_without_deleting(self):
+        self.start_session(problem="First problem", script=[propose_cause(), request_evidence()])
+        first_id = phone_app.STATE["history_session_id"]
+        self.assertIsNotNone(first_id)
+        self.start_session(problem="Second problem", script=[propose_cause(), request_evidence()])
+        second_id = phone_app.STATE["history_session_id"]
+        self.assertNotEqual(first_id, second_id)
+        store = phone_app.get_store()
+        sessions = {s["id"]: s for s in store.list_sessions()}
+        self.assertEqual(set(sessions), {first_id, second_id})
+        self.assertEqual(sessions[first_id]["archived"], 1)
+        self.assertEqual(sessions[second_id]["archived"], 0)
+        first_titles = [e["title"] for e in store.get_events(first_id)]
+        self.assertIn("Session started", first_titles)
+        self.assertIn("Test requested", first_titles)
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("Investigation 1", body)
+        self.assertIn("Investigation 2", body)
+
+    def test_archive_view_is_read_only(self):
+        self.start_session(problem="First", script=[propose_cause(), request_evidence()])
+        first_id = phone_app.STATE["history_session_id"]
+        self.start_session(problem="Second", script=[propose_cause(), request_evidence()])
+        live_loop = phone_app.STATE["loop"]
+        response = self.client.get(f"/history/{first_id}")
+        body = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("archived · read-only", body)
+        self.assertIn("Test requested", body)
+        self.assertIn("Back to live investigation", body)
+        self.assertNotIn("Submit & continue", body)
+        self.assertNotIn('id="resumeForm"', body)
+        self.assertNotIn('id="answerInput"', body)
+        self.assertIs(phone_app.STATE["loop"], live_loop)
+        self.assertEqual(phone_app.STATE["loop"].session.snapshot.problem, "Second")
+
+    def test_history_parity_no_fabrication(self):
+        _, fake = self.start_session(script=[propose_cause(), request_evidence()])
+        fake.stage(propose_cause("Cause B"), request_evidence())
+        self.client.post("/resume", data={"answer": "The light is steady green."},
+                         follow_redirects=True)
+        memory = [(e["kind"], e["title"], e["detail"]) for e in phone_app.STATE["timeline"]]
+        stored = [(e["kind"], e["title"], e["detail"]) for e in phone_app.get_store().get_events(
+            phone_app.STATE["history_session_id"])]
+        self.assertEqual(stored, memory)
+        self.assertGreater(len(stored), 4)
+
+    def test_restart_reopen_keeps_history(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        hid = phone_app.STATE["history_session_id"]
+        reopened = HistoryStore(phone_app.get_store().path)
+        events = reopened.get_events(hid)
+        self.assertEqual([e["title"] for e in events],
+                         [e["title"] for e in phone_app.STATE["timeline"]])
+        self.assertEqual(reopened.get_session(hid)["archived"], 1)
+
+    def test_photo_bytes_never_persisted(self):
+        def factory(image):
+            return RecordingFake([propose_cause(), request_evidence()]), "Test Provider"
+
+        with patch("phone_app.create_provider", side_effect=factory):
+            self.client.post(
+                "/start",
+                data={"problem": "No display", "image": (io.BytesIO(PNG_BYTES), "photo.png")},
+                content_type="multipart/form-data",
+                follow_redirects=True,
+            )
+        hid = phone_app.STATE["history_session_id"]
+        events = phone_app.get_store().get_events(hid)
+        photos = [e for e in events if e["kind"] == "photo"]
+        self.assertEqual(len(photos), 1)
+        self.assertIn("not stored", photos[0]["detail"])
+        blob = "\n".join(e["title"] + e["detail"] for e in events)
+        self.assertNotIn("base64", blob)
+        self.assertIn("Photo attached", self.client.get("/").get_data(as_text=True))
+
+    def test_rename_session(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        hid = phone_app.STATE["history_session_id"]
+        response = self.client.post(f"/history/{hid}/rename", data={"name": "Front desk PC"},
+                                    follow_redirects=True)
+        self.assertIn("Front desk PC", response.get_data(as_text=True))
+        self.assertEqual(phone_app.get_store().get_session(hid)["name"], "Front desk PC")
+        response = self.client.post(f"/history/{hid}/rename", data={"name": "   "},
+                                    follow_redirects=True)
+        self.assertIn("must not be empty", response.get_data(as_text=True))
+        self.assertEqual(phone_app.get_store().get_session(hid)["name"], "Front desk PC")
+
+    def test_unknown_history_redirects_with_error(self):
+        response = self.client.post("/history/nope/rename", data={"name": "x"},
+                                    follow_redirects=True)
+        self.assertIn("Investigation not found.", response.get_data(as_text=True))
+        response = self.client.get("/history/nope", follow_redirects=True)
+        self.assertIn("Investigation not found.", response.get_data(as_text=True))
+
+
+    def test_cinematic_orb_layers_present(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("orb-spin-d", body)
+        self.assertIn("orb-inner", body)
+        self.assertIn("orb-scanline", body)
+        self.assertIn("completeBurst", body)
+        self.assertIn("body.completed .orb-core", body)
+        self.assertIn("bg-glow-a", body)
+        self.assertIn("bg-glow-b", body)
+        self.assertIn("onboundary", body)
+        self.assertIn("word-pop", body)
+        self.assertIn('querySelector(".card.final")', body)
+
+    def test_motion_respects_reduced_motion(self):
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("prefers-reduced-motion", body)
+        self.assertIn(".orb-scanline { opacity:0 !important; }", body)
+
+
+    def test_recent_bubbles_link_to_timeline(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn('class="recents"', body)
+        self.assertIn("New cause considered", body)
+        self.assertIn('href="#t-2"', body)
+        self.assertIn('id="t-2"', body)
+        self.assertIn('href="#t-3"', body)
+        self.assertIn('id="t-3"', body)
+        self.assertIn("bubblePop", body)
+
+    def test_user_recents_styled_distinctly(self):
+        _, fake = self.start_session(script=[propose_cause(), request_evidence()])
+        fake.stage("garbage")
+        self.client.post("/resume", data={"answer": "The light is steady green."},
+                         follow_redirects=True)
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("recent-user", body)
+        self.assertIn("You reported", body)
+
+    def test_no_recents_before_session(self):
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertNotIn('class="recents"', body)
+
+
+    def test_history_drawer_markup(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn('<details class="drawer">', body)
+        self.assertIn("History & timeline", body)
+        self.assertIn(".drawer:not([open])", body)
+        self.assertNotIn('<details class="drawer" open', body)
+
+    def test_hypothesis_status_markers(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn('data-status="possible"', body)
+        self.assertIn('.hypothesis[data-status="supported"]', body)
+        self.assertIn('.hypothesis[data-status="eliminated"]', body)
+
+    def test_touch_and_type_polish(self):
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("touch-action:manipulation", body)
+        self.assertIn("line-height:1.5", body)
+
+
+    def test_drawer_desktop_sync_script_present(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn('querySelector(".drawer")', body)
+        self.assertIn("matchMedia", body)
+        self.assertIn("syncDrawer", body)
+        self.assertIn("body.js .drawer>summary", body)
+
+    def test_rename_escapes_html(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        hid = phone_app.STATE["history_session_id"]
+        response = self.client.post(
+            f"/history/{hid}/rename", data={"name": "<script>alert(1)</script>"},
+            follow_redirects=True)
+        body = response.get_data(as_text=True)
+        self.assertNotIn("<script>alert(1)</script>", body)
+        self.assertIn("&lt;script&gt;", body)
 
 
 if __name__ == "__main__":

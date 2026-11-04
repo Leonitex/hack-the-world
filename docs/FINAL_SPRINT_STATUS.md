@@ -1,7 +1,8 @@
-# Final Sprint Status (M3–M6)
+# Final Sprint Status (M3–M7)
 
 Branch: `work/final-hackathon-sprint`, based on `origin/work/phone-mvp`.
 Follow-up branch: `work/final-polish-followup` (issue #6: M6A/M6B/M6C).
+Milestone 7 branch: `work/persistent-history-cinematic-ui` (7A–7E).
 Trust core preserved: `diagnostic_core/` and the `AgentLoop` validation
 architecture are unchanged from the Milestone 2A checkpoint. All pre-existing
 Milestone 1/2 tests still pass.
@@ -179,3 +180,72 @@ Still needs a human: the live smoke above; read-aloud, mic
 permission/text fallback, photo upload, and error/retry recovery on
 desktop Chrome/Edge; a Samsung A17 orb/layout check; the three-minute
 demo recording.
+
+## M7A — Persistent investigation history: DONE (code + tests)
+
+New `history_store.py` (stdlib sqlite3, `data/history.db`, overridable
+via `HTW_HISTORY_DB`): session rows with auto-names plus per-session
+sequenced event rows with UTC timestamps, written atomically alongside
+the in-memory timeline. Starting or resetting archives the previous
+session instead of deleting it; a startup sweep marks sessions from
+older processes as read-only archives, so a restart never presents a
+dead session as resumable. Sessions list with live/archived badges,
+rename, and a read-only archive view with full timelines. Photo bytes
+are never persisted — only a "shown this round, not stored" marker with
+the real record id.
+
+Tests: 11 store tests (ordering, reopen persistence, sweep, archive,
+rename, isolation) + 7 app tests (archive-on-new, read-only view,
+memory/DB parity, restart reopen, photo privacy, rename, unknown id).
+
+## M7B/M7C/M7D — Cinematic UI: DONE (code + tests; browser/device acceptance manual)
+
+Orb: fourth ring, inner plasma shimmer, dual orbiting markers,
+thinking-only scanline, one-shot completed burst + lingering green
+tint, word-boundary speech pulse (progressive enhancement), drifting
+ambient background — all transform/opacity CSS, no new dependencies.
+Bubbles: primary entrance animation plus the last two timeline entries
+as reduced-emphasis bubbles linking to anchored timeline items, with
+distinct user styling. Layout: mobile-collapsible history drawer that
+stays open on desktop (CSS + `matchMedia` sync, no-JS safe),
+status-colored hypothesis markers from real core statuses,
+touch-action, and readable line height.
+
+Tests: +10 app pins (orb layers, reduced motion, recents/anchors,
+user styling, no pre-session recents, drawer, markers, polish, drawer
+sync, rename escaping).
+
+## M7E — Regression: green (live BLOCKED)
+
+179 tests green, `compileall` clean, `git diff --check` clean, JS
+`node --check` clean, HTTP smoke (`GET /`, empty `/start`, unknown
+`/history/<id>`) all correct. `diagnostic_core/` untouched. Self-review
+covered UX (drawer defaults, no-JS fallback), accessibility (live
+regions, focus, labels, no color-only signals), security (rename
+escaping proven, photo bytes excluded, API errors sanitized), and
+performance (no blur/canvas animation loops; one-shot burst only).
+
+Live Meta test: BLOCKED from this shell — no `MODEL_API_KEY` /
+`META_MODEL_API_KEY` inherited, so no live call was made or claimed.
+In the window where the key is set:
+
+```powershell
+cd C:\Users\Scott\hack-the-world
+git checkout work/persistent-history-cinematic-ui
+.\.venv\Scripts\Activate.ps1
+python live_m6c_smoke.py
+```
+
+App launch:
+
+```powershell
+cd C:\Users\Scott\hack-the-world
+git checkout work/persistent-history-cinematic-ui
+.\.venv\Scripts\Activate.ps1
+python phone_app.py
+# open http://127.0.0.1:8000 (history persists in data/history.db)
+```
+
+Still needs a human: the live smoke; orb/bubble/drawer feel and voice
+round-trip on desktop Chrome/Edge; the Samsung A17 check; multi-day
+history retention spot-check; the demo recording.

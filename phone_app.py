@@ -12,12 +12,14 @@ from agent.loop import AgentLoop, LoopOutcome
 from agent.providers import ProviderError
 from diagnostic_core.engine import DiagnosticSession
 from diagnostic_core.models import Rejected
+from history_store import HistoryStore
 
 app = Flask(__name__)
 
 STATE = {"loop": None, "last_result": None, "error": None, "provider": None,
          "provider_label": None, "images": {}, "advance_note": None,
-         "timeline": [], "draft_problem": "", "draft_answer": ""}
+         "timeline": [], "draft_problem": "", "draft_answer": "",
+         "history_session_id": None}
 
 # Per-round decision allowance vs session-wide billed-step cap. Each user
 # result grants a fresh advance; the session cap keeps retries bounded.
@@ -27,6 +29,17 @@ SESSION_STEP_BUDGET = 60
 # Factual timeline entries are derived only from real snapshot diffs and
 # real user inputs; the UI never invents conversation history.
 TIMELINE_LIMIT = 60
+
+_STORE = None
+
+
+def get_store():
+    """Process-wide history store, created lazily so imports stay side-effect free."""
+    global _STORE
+    if _STORE is None:
+        default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "history.db")
+        _STORE = HistoryStore(os.environ.get("HTW_HISTORY_DB", default))
+    return _STORE
 
 PAGE = r"""
 <!doctype html>
@@ -60,7 +73,7 @@ header.top { display:flex; align-items:center; justify-content:space-between; ga
 .final { border-color:#39715f; background:linear-gradient(180deg,#10231d,#0d1916); }
 .hero { text-align:center; padding:6px 0 2px; }
 .orb-wrap { width:248px; height:248px; margin:0 auto; position:relative; display:grid; place-items:center; }
-.orb-svg { width:100%; height:100%; overflow:visible; }
+.orb-svg { width:100%; height:100%; overflow:visible; transition:transform .12s ease; }
 .orb-spin-a { animation:orbSpin 9s linear infinite; transform-box:view-box; transform-origin:120px 120px; }
 .orb-spin-b { animation:orbSpin 14s linear infinite reverse; transform-box:view-box; transform-origin:120px 120px; }
 .orb-spin-c { animation:orbSpin 5s linear infinite; transform-box:view-box; transform-origin:120px 120px; }
@@ -92,7 +105,7 @@ body.error .orb-spin-a circle { stroke:var(--bad); }
 .bubble .state { color:var(--accent); font-size:12px; font-weight:800; letter-spacing:.8px; text-transform:uppercase; margin-bottom:6px; }
 .bubble .message { font-size:18px; line-height:1.45; }
 .controls { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px,1fr)); gap:10px; max-width:640px; margin:0 auto 16px; }
-button { appearance:none; border:0; cursor:pointer; border-radius:12px; min-height:48px; padding:12px 14px; font-weight:700; font-size:15px; background:linear-gradient(135deg, #d8f5ff, #bbcbff); color:#0a1018; }
+button { appearance:none; border:0; cursor:pointer; touch-action:manipulation; border-radius:12px; min-height:48px; padding:12px 14px; font-weight:700; font-size:15px; background:linear-gradient(135deg, #d8f5ff, #bbcbff); color:#0a1018; }
 button.secondary { background:#121d2a; color:#dce9f7; border:1px solid #2a4058; }
 button.mic-active { background:linear-gradient(135deg, #c7ffe5, #a6e9ff); }
 button:disabled { opacity:.55; cursor:wait; }
@@ -127,25 +140,71 @@ details[open] summary { margin-bottom:12px; }
 .fab { position:fixed; right:18px; bottom:18px; width:60px; height:60px; border-radius:50%; padding:0; display:grid; place-items:center; font-size:12px; font-weight:800; letter-spacing:1px; box-shadow:0 12px 32px rgba(0,0,0,.4); }
 .big-action { font-size:19px; line-height:1.45; }
 @media (max-width:520px) { main { padding-left:14px; padding-right:14px; } .orb-wrap { width:212px; height:212px; } .orb-sweep { width:168px; height:168px; } .composer-row { grid-template-columns:1fr; } button { width:100%; } .progress { gap:3px; } .step { font-size:9px; } }
-@media (prefers-reduced-motion:reduce) { .orb-svg *, .orb-sweep, .card { animation:none !important; } .orb-core { transition:none; } }
+.sessions { list-style:none; margin:0; padding:0; }
+.sessions li { padding:8px 0; border-top:1px solid #1c2c40; }
+.sessions li:first-child { border-top:0; padding-top:0; }
+.sessions a { color:var(--accent); font-weight:700; text-decoration:none; }
+input[type=text] { width:100%; border-radius:12px; padding:10px 12px; background:#09111a; color:#fff; border:1px solid #2b3e52; font:inherit; }
+.rename-row { display:flex; gap:8px; margin-top:8px; }
+.rename-row button { white-space:nowrap; }
+.orb-spin-d { animation:orbSpin 22s linear infinite; transform-box:view-box; transform-origin:120px 120px; }
+.orb-spin-a circle,.orb-spin-b circle,.orb-spin-d circle { transition:stroke .3s ease; }
+.orb-inner { animation:shimmer 3s ease-in-out infinite alternate; transform-box:fill-box; transform-origin:center; }
+@keyframes shimmer { from { opacity:.4; } to { opacity:.7; } }
+.orb-scanline { position:absolute; left:8%; right:8%; top:50%; height:2px; border-radius:2px; background:linear-gradient(90deg, transparent, rgba(140,220,255,.8), transparent); opacity:0; pointer-events:none; }
+body.thinking .orb-scanline { opacity:1; animation:scanY 1.3s ease-in-out infinite alternate; }
+@keyframes scanY { from { transform:translateY(-52px); } to { transform:translateY(52px); } }
+body.completed .orb-core { animation:completeBurst 2.2s ease-out 1; }
+body.completed .orb-spin-a circle { stroke:var(--good); }
+@keyframes completeBurst { 0% { transform:scale(1); filter:brightness(1); } 30% { transform:scale(1.22); filter:brightness(1.6); } 100% { transform:scale(1); filter:brightness(1.1); } }
+.word-pop .orb-svg { transform:scale(1.03); }
+.bg-glow-a,.bg-glow-b { position:fixed; border-radius:50%; pointer-events:none; z-index:-1; }
+.bg-glow-a { width:520px; height:520px; left:-160px; top:-120px; background:radial-gradient(circle, rgba(83,116,255,.12), transparent 65%); animation:glowDrift 26s ease-in-out infinite alternate; }
+.bg-glow-b { width:620px; height:620px; right:-220px; top:30%; background:radial-gradient(circle, rgba(69,208,255,.09), transparent 65%); animation:glowDrift 34s ease-in-out infinite alternate-reverse; }
+@keyframes glowDrift { from { transform:translate(0,0); } to { transform:translate(60px,40px); } }
+.bubble { animation:bubblePop .45s cubic-bezier(.2,.9,.3,1.15) both; }
+@keyframes bubblePop { from { opacity:0; transform:scale(.96) translateY(6px); } }
+.recents { display:grid; gap:8px; max-width:640px; margin:0 auto 14px; }
+.recent-bubble { display:block; text-align:left; opacity:.72; border:1px solid #22364d; border-radius:14px; padding:9px 12px; color:var(--text); text-decoration:none; background:rgba(13,20,30,.7); animation:rise .4s ease both; font-size:13px; }
+.recent-bubble strong { display:block; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.6px; margin-bottom:2px; }
+.recent-bubble span { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.recent-user { border-color:#2f5a4c; }
+.recent-user strong { color:var(--good); }
+body { line-height:1.5; }
+.drawer { border:0; padding:0; margin:0; }
+.drawer>summary { list-style:none; cursor:pointer; font-weight:800; color:#c9d9e8; background:rgba(13,20,30,.94); border:1px solid var(--line); border-radius:14px; padding:12px 14px; margin-bottom:10px; }
+.drawer>summary::-webkit-details-marker { display:none; }
+.drawer-body { display:grid; gap:14px; align-content:start; }
+@media (min-width:1024px) { body.js .drawer>summary { display:none; } .drawer:not([open])>.drawer-body { display:grid; } }
+.hypothesis[data-status="supported"]::before,.hypothesis[data-status="confirmed"]::before { background:var(--good); }
+.hypothesis[data-status="weakened"]::before { background:#ffcf7d; }
+.hypothesis[data-status="eliminated"]::before { background:var(--bad); }
+@media (prefers-reduced-motion:reduce) { .orb-svg *, .orb-sweep, .card, .bubble, .recent-bubble, .bg-glow-a, .bg-glow-b, .orb-scanline { animation:none !important; } .orb-core, .orb-svg { transition:none; } .orb-scanline { opacity:0 !important; } }
 </style>
 </head>
 <body class="idle">
+<div class="bg-glow-a"></div><div class="bg-glow-b"></div>
 {% macro assistant_hero() %}<div class="card"><div class="hero">
-<div class="orb-wrap" role="img" aria-label="Assistant status"><div class="orb-sweep"></div><svg class="orb-svg" viewBox="0 0 240 240" aria-hidden="true"><defs><radialGradient id="orbCore" cx="38%" cy="32%" r="75%"><stop offset="0%" stop-color="#e8fbff"/><stop offset="18%" stop-color="#7fdcff"/><stop offset="45%" stop-color="#4f79e8"/><stop offset="72%" stop-color="#232a55"/><stop offset="100%" stop-color="#0c1226"/></radialGradient><radialGradient id="orbCoreError" cx="38%" cy="32%" r="75%"><stop offset="0%" stop-color="#ffe8ec"/><stop offset="25%" stop-color="#ff8b98"/><stop offset="55%" stop-color="#a83a4a"/><stop offset="100%" stop-color="#2a0e14"/></radialGradient><radialGradient id="orbHalo" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#66d9ff" stop-opacity=".28"/><stop offset="55%" stop-color="#8b7cff" stop-opacity=".1"/><stop offset="100%" stop-color="#8b7cff" stop-opacity="0"/></radialGradient><linearGradient id="orbArc" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#66d9ff"/><stop offset="100%" stop-color="#8b7cff"/></linearGradient></defs><circle cx="120" cy="120" r="112" fill="url(#orbHalo)" class="orb-breathe"/><g class="orb-spin-a"><circle cx="120" cy="120" r="86" fill="none" stroke="url(#orbArc)" stroke-width="2.5" stroke-dasharray="52 26 12 26" stroke-linecap="round" opacity=".9"/></g><g class="orb-spin-b"><circle cx="120" cy="120" r="70" fill="none" stroke="#66d9ff" stroke-width="1.5" stroke-dasharray="4 10" opacity=".55"/></g><g class="orb-spin-c"><circle cx="120" cy="34" r="7" fill="#8fe9ff" opacity=".25"/><circle cx="120" cy="34" r="3.5" fill="#8fe9ff"/></g><circle cx="120" cy="120" r="46" fill="url(#orbCore)" class="orb-core"/><ellipse cx="104" cy="102" rx="20" ry="12" fill="#ffffff" opacity=".28" transform="rotate(-24 104 102)"/><g fill="#9fdcff"><circle cx="52" cy="88" r="1.6" class="orb-p1"/><circle cx="188" cy="96" r="1.3" class="orb-p2"/><circle cx="60" cy="160" r="1.4" class="orb-p3"/><circle cx="182" cy="162" r="1.7" class="orb-p4"/></g></svg><div class="orb-label" id="orbLabel">Ready</div></div>
+<div class="orb-wrap" role="img" aria-label="Assistant status"><div class="orb-sweep"></div><div class="orb-scanline"></div><svg class="orb-svg" viewBox="0 0 240 240" aria-hidden="true"><defs><radialGradient id="orbCore" cx="38%" cy="32%" r="75%"><stop offset="0%" stop-color="#e8fbff"/><stop offset="18%" stop-color="#7fdcff"/><stop offset="45%" stop-color="#4f79e8"/><stop offset="72%" stop-color="#232a55"/><stop offset="100%" stop-color="#0c1226"/></radialGradient><radialGradient id="orbCoreError" cx="38%" cy="32%" r="75%"><stop offset="0%" stop-color="#ffe8ec"/><stop offset="25%" stop-color="#ff8b98"/><stop offset="55%" stop-color="#a83a4a"/><stop offset="100%" stop-color="#2a0e14"/></radialGradient><radialGradient id="orbHalo" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#66d9ff" stop-opacity=".28"/><stop offset="55%" stop-color="#8b7cff" stop-opacity=".1"/><stop offset="100%" stop-color="#8b7cff" stop-opacity="0"/></radialGradient><linearGradient id="orbArc" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#66d9ff"/><stop offset="100%" stop-color="#8b7cff"/></linearGradient></defs><circle cx="120" cy="120" r="112" fill="url(#orbHalo)" class="orb-breathe"/><g class="orb-spin-a"><circle cx="120" cy="120" r="86" fill="none" stroke="url(#orbArc)" stroke-width="2.5" stroke-dasharray="52 26 12 26" stroke-linecap="round" opacity=".9"/></g><g class="orb-spin-b"><circle cx="120" cy="120" r="70" fill="none" stroke="#66d9ff" stroke-width="1.5" stroke-dasharray="4 10" opacity=".55"/></g><g class="orb-spin-d"><circle cx="120" cy="120" r="98" fill="none" stroke="#8b7cff" stroke-width="1" stroke-dasharray="26 18 6 18" opacity=".4"/></g><g class="orb-spin-c"><circle cx="120" cy="34" r="7" fill="#8fe9ff" opacity=".25"/><circle cx="120" cy="34" r="3.5" fill="#8fe9ff"/><circle cx="120" cy="206" r="6" fill="#8fe9ff" opacity=".2"/><circle cx="120" cy="206" r="3" fill="#8fe9ff"/></g><circle cx="120" cy="120" r="46" fill="url(#orbCore)" class="orb-core"/><circle cx="120" cy="120" r="29" fill="url(#orbCore)" class="orb-inner"/><ellipse cx="104" cy="102" rx="20" ry="12" fill="#ffffff" opacity=".28" transform="rotate(-24 104 102)"/><g fill="#9fdcff"><circle cx="52" cy="88" r="1.6" class="orb-p1"/><circle cx="188" cy="96" r="1.3" class="orb-p2"/><circle cx="60" cy="160" r="1.4" class="orb-p3"/><circle cx="182" cy="162" r="1.7" class="orb-p4"/></g></svg><div class="orb-label" id="orbLabel">Ready</div></div>
 <div class="orb-sub" id="orbSub">{% if error %}Needs attention{% elif session.next_action %}Next test ready{% elif session.recommendation %}Verified recommendation ready{% elif session %}Reviewing evidence{% else %}Ready{% endif %}</div>
 <div class="bubble" id="assistantBubble" aria-live="polite"><div class="state" id="assistantState">{% if error %}Attention{% elif session and session.recommendation %}Verified{% elif session and session.next_action %}Next diagnostic step{% elif session %}Investigating{% else %}Ready{% endif %}</div><div class="message" id="assistantMessage">{% if error %}{{ error }}{% elif session and session.recommendation %}{{ session.recommendation.action }}{% elif session and session.next_action %}{{ session.next_action.action }}{% elif session %}I am reviewing the evidence and testing competing causes.{% else %}Tell me what the device is doing. You can speak, type, or add a photo.{% endif %}</div></div>
+{% if recents %}<div class="recents">{% for pos, entry in recents %}<a class="recent-bubble{% if entry.kind == 'user' %} recent-user{% endif %}" href="#t-{{ pos }}"><strong>{{ entry.title }}</strong><span>{{ entry.detail }}</span></a>{% endfor %}</div>{% endif %}
 <div class="controls"><button type="button" class="secondary" id="speakButton" onclick="speakCurrent()">Hear instruction</button><button type="button" class="secondary" id="stopButton" onclick="stopSpeech()">Stop</button><button type="button" class="secondary" id="handsFreeButton" onclick="toggleHandsFree()">Hands-free: off</button></div>
 <div class="voice-note" id="voiceSupport" role="status"></div>
 </div></div>{% endmacro %}
+{% macro session_list(title) %}<h2>{{ title }}</h2><ul class="sessions">{% for s in sessions %}<li><a href="{{ url_for('view_history', session_id=s.id) }}">{{ s.name }}</a> <span class="badge">{% if s.archived %}archived{% else %}live{% endif %}</span><div class="muted">{{ s.updated_at[:16].replace("T", " ") }} UTC</div></li>{% endfor %}</ul>{% endmacro %}
 <main>
 <header class="top"><div class="brand">Hack the World<small>Evidence-driven field diagnostics</small></div><div class="meta">{{ provider_label or "Meta Muse" }}</div></header>
 {% if error %}<div class="strip"><div class="card error" id="errorCard" tabindex="-1"><strong>Something needs attention</strong><div>{{ error }}</div></div></div>{% endif %}
 {% if advance_note %}<div class="strip"><div class="card next">{{ advance_note }}</div></div>{% endif %}
 {% if result and (result.outcome.value == "provider_error" or result.outcome.value == "advance_exhausted") %}<div class="strip"><form method="post" action="{{ url_for('retry') }}"><button type="submit" class="secondary" style="width:100%">Try again</button></form></div>{% endif %}
-{% if not session %}
+{% if viewing %}
+<div class="strip"><div class="card"><h2>{{ viewing.session.name }}</h2><div class="badges"><span class="badge">{% if viewing.session.archived %}archived · read-only{% else %}live{% endif %}</span><span class="badge">{{ viewing.events|length }} events</span></div><div class="muted">{{ viewing.session.problem }}</div><form method="post" action="{{ url_for('rename_history', session_id=viewing.session.id) }}"><div class="rename-row"><input type="text" name="name" value="{{ viewing.session.name }}" maxlength="80" aria-label="Session name"><button type="submit" class="secondary">Rename</button></div></form><div style="margin-top:10px"><a href="{{ url_for('index') }}">{% if session %}Back to live investigation{% else %}Back{% endif %}</a></div></div></div>
+<div class="strip"><div class="card"><h2>Timeline</h2>{% if viewing.events %}<ol class="timeline">{% for entry in viewing.events %}<li class="t-event"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>#{{ entry.seq }} · {{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div><div class="muted">{{ entry.created_at[:16].replace("T", " ") }} UTC</div></div></li>{% endfor %}</ol>{% else %}<div class="muted">No events recorded yet.</div>{% endif %}</div></div>
+{% elif not session %}
 <div class="strip">{{ assistant_hero() }}</div>
 <div class="strip"><div class="card"><form id="startForm" method="post" action="{{ url_for('start') }}" enctype="multipart/form-data"><h2>Start an investigation</h2><label>Describe the problem</label><textarea id="problemInput" name="problem" required placeholder="Example: Laptop powers on, fan spins, but the screen stays black.">{{ draft_problem }}</textarea><div class="controls" style="margin:10px 0 4px"><button type="button" class="secondary" onclick="startDictation('problemInput', this)">Speak symptoms</button><button type="button" class="secondary" onclick="document.getElementById('imageInput').click()">Add photo</button></div><div class="filebox"><input id="imageInput" type="file" name="image" accept="image/*" capture="environment"><small>A clear device photo is optional, but makes the demo visibly multimodal.</small></div><button type="submit" style="width:100%;margin-top:12px">Begin investigation</button></form></div></div>
+{% if sessions %}<div class="strip"><div class="card">{{ session_list("Previous investigations") }}</div></div>{% endif %}
 {% else %}
 <div class="layout">
 <section class="zone-assistant" aria-label="Assistant">
@@ -155,8 +214,8 @@ details[open] summary { margin-bottom:12px; }
 {% if session.recommendation %}<div class="card final"><h2>Verified recommendation</h2><p class="big-action">{{ session.recommendation.action }}</p><small>Grounded in {{ session.recommendation.evidence_ids|length }} recorded evidence item(s).</small></div>{% endif %}
 <form method="post" action="{{ url_for('reset') }}"><button type="submit" class="secondary" style="width:100%">Start a new investigation</button></form>
 </section>
-{% if timeline %}<section class="zone-timeline" aria-label="Investigation timeline"><div class="card sticky"><h2>Timeline</h2><ol class="timeline">{% for entry in timeline %}<li class="t-event"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>{{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div></div></li>{% endfor %}</ol></div></section>{% endif %}
-<section class="zone-tech" aria-label="Technical details"><div class="card sticky"><details><summary>Evidence & technical details</summary><h3>Evidence</h3>{% if session.evidence %}<div class="evidence-grid">{% for e in session.evidence %}<details class="evidence-chip"><summary><strong>{{ e.id.split(':')[-1] }}</strong> · {{ e.statement }}</summary><div class="muted">Source: {{ e.source }}</div>{% for pair in e.provenance %}<div class="muted">{{ pair[0] }}: {{ pair[1] }}</div>{% endfor %}</details>{% endfor %}</div>{% else %}<div class="muted">No evidence recorded yet.</div>{% endif %}<h3>Competing hypotheses</h3>{% if session.hypotheses %}{% for h in session.hypotheses %}<div class="hypothesis"><strong>{{ h.cause }}</strong><div class="badges"><span class="badge">{{ h.status }}</span></div>{% if h.rationale %}<small>{{ h.rationale }}</small>{% endif %}</div>{% endfor %}{% else %}<div class="muted">No cause proposed yet.</div>{% endif %}</details></div></section>
+<section class="zone-timeline" aria-label="Investigation history"><details class="drawer"><summary>History & timeline</summary><div class="drawer-body">{% if sessions %}<div class="card sticky">{{ session_list("Investigations") }}</div>{% endif %}{% if timeline %}<div class="card"><h2>Timeline</h2><ol class="timeline">{% for entry in timeline %}<li class="t-event" id="t-{{ loop.index }}"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>{{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div></div></li>{% endfor %}</ol></div>{% endif %}</div></details></section>
+<section class="zone-tech" aria-label="Technical details"><div class="card sticky"><details><summary>Evidence & technical details</summary><h3>Evidence</h3>{% if session.evidence %}<div class="evidence-grid">{% for e in session.evidence %}<details class="evidence-chip"><summary><strong>{{ e.id.split(':')[-1] }}</strong> · {{ e.statement }}</summary><div class="muted">Source: {{ e.source }}</div>{% for pair in e.provenance %}<div class="muted">{{ pair[0] }}: {{ pair[1] }}</div>{% endfor %}</details>{% endfor %}</div>{% else %}<div class="muted">No evidence recorded yet.</div>{% endif %}<h3>Competing hypotheses</h3>{% if session.hypotheses %}{% for h in session.hypotheses %}<div class="hypothesis" data-status="{{ h.status }}"><strong>{{ h.cause }}</strong><div class="badges"><span class="badge">{{ h.status }}</span></div>{% if h.rationale %}<small>{{ h.rationale }}</small>{% endif %}</div>{% endfor %}{% else %}<div class="muted">No cause proposed yet.</div>{% endif %}</details></div></section>
 </div>
 {% endif %}
 </main>
@@ -164,18 +223,19 @@ details[open] summary { margin-bottom:12px; }
 <script>
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 let activeRecognition = null;
+let wordTimer = null;
 let handsFree = localStorage.getItem("htwHandsFree") === "1";
-function setOrbState(state,label,bubbleText,subText){document.body.classList.remove("idle","listening","thinking","speaking","error");document.body.classList.add(state);document.getElementById("orbLabel").textContent=label||state;if(bubbleText)document.getElementById("assistantMessage").textContent=bubbleText;const sub=document.getElementById("orbSub");if(sub){if(subText)sub.textContent=subText;else if(state==="idle"&&sub.dataset.base)sub.textContent=sub.dataset.base;}}
+function setOrbState(state,label,bubbleText,subText){document.body.classList.remove("idle","listening","thinking","speaking","error");/* completed lingers as a tint, never removed here */document.body.classList.add(state);document.getElementById("orbLabel").textContent=label||state;if(bubbleText)document.getElementById("assistantMessage").textContent=bubbleText;const sub=document.getElementById("orbSub");if(sub){if(subText)sub.textContent=subText;else if(state==="idle"&&sub.dataset.base)sub.textContent=sub.dataset.base;}}
 function updateHandsFreeButton(){const btn=document.getElementById("handsFreeButton");if(btn)btn.textContent=handsFree?"Hands-free: on":"Hands-free: off";}
 function toggleHandsFree(){handsFree=!handsFree;localStorage.setItem("htwHandsFree",handsFree?"1":"0");updateHandsFreeButton();if(handsFree)speakCurrent();else if("speechSynthesis" in window)window.speechSynthesis.cancel();}
 function chooseProfessionalVoice(){const voices=window.speechSynthesis?window.speechSynthesis.getVoices():[];return voices.find(v=>/Google UK English Male|Microsoft.*(David|Ryan|George)/i.test(v.name))||voices.find(v=>/^en-GB/i.test(v.lang))||voices.find(v=>/^en-US/i.test(v.lang))||voices[0];}
-function speak(text){if(!("speechSynthesis" in window)||!text)return;window.speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text);const voice=chooseProfessionalVoice();if(voice)u.voice=voice;u.rate=.94;u.pitch=.92;u.volume=1;u.onstart=()=>setOrbState("speaking","Speaking",null,"Speaking…");u.onend=()=>setOrbState("idle","Ready");u.onerror=()=>{setOrbState("error","Error","Spoken instructions hit a playback problem.","Needs attention");setTimeout(()=>{if(document.body.classList.contains("error"))setOrbState("idle","Ready");},4000);};window.speechSynthesis.speak(u);}
+function speak(text){if(!("speechSynthesis" in window)||!text)return;window.speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text);const voice=chooseProfessionalVoice();if(voice)u.voice=voice;u.rate=.94;u.pitch=.92;u.volume=1;u.onstart=()=>setOrbState("speaking","Speaking",null,"Speaking…");u.onboundary=(e)=>{if(e&&e.name==="word"){document.body.classList.add("word-pop");clearTimeout(wordTimer);wordTimer=setTimeout(()=>document.body.classList.remove("word-pop"),130);}};u.onend=()=>setOrbState("idle","Ready");u.onerror=()=>{setOrbState("error","Error","Spoken instructions hit a playback problem.","Needs attention");setTimeout(()=>{if(document.body.classList.contains("error"))setOrbState("idle","Ready");},4000);};window.speechSynthesis.speak(u);}
 function stopSpeech(){if("speechSynthesis" in window)window.speechSynthesis.cancel();setOrbState("idle","Ready");}
 function speakCurrent(){const text=document.getElementById("assistantMessage")?.innerText?.trim();speak(text);}
 function startDictation(targetId,button){const target=document.getElementById(targetId);if(!target)return;if(!SpeechRecognition){document.getElementById("voiceSupport").textContent="Voice recognition is not available in this browser. You can still type and use spoken instructions.";return;}if(activeRecognition){try{activeRecognition.stop();}catch(_){}}const recognition=new SpeechRecognition();activeRecognition=recognition;recognition.lang="en-US";recognition.interimResults=true;recognition.continuous=false;const original=target.value.trim();let finalText="";recognition.onstart=()=>{setOrbState("listening","Listening","Listening. Tell me exactly what you observe.","Listening…");if(button)button.classList.add("mic-active");};recognition.onresult=(event)=>{let interim="";finalText="";for(let i=event.resultIndex;i<event.results.length;i++){const chunk=event.results[i][0].transcript;if(event.results[i].isFinal)finalText+=chunk;else interim+=chunk;}const spoken=(finalText||interim).trim();target.value=[original,spoken].filter(Boolean).join(original&&spoken?" ":"");};recognition.onerror=(event)=>{setOrbState("error","Error","I couldn't hear that clearly. You can try again or type the result.","Needs attention");setTimeout(()=>{if(document.body.classList.contains("error"))setOrbState("idle","Ready");},4000);document.getElementById("voiceSupport").textContent="Microphone: "+event.error;};recognition.onend=()=>{activeRecognition=null;if(button)button.classList.remove("mic-active");if(!document.body.classList.contains("error"))setOrbState("idle","Ready");};recognition.start();}
 function floatingMic(){const answer=document.getElementById("answerInput");const problem=document.getElementById("problemInput");if(answer)startDictation("answerInput",document.getElementById("floatingMic"));else if(problem)startDictation("problemInput",document.getElementById("floatingMic"));else speakCurrent();}
 for(const form of document.querySelectorAll("form")){form.addEventListener("submit",(event)=>{if(form.dataset.submitted){event.preventDefault();return;}form.dataset.submitted="1";if(form.id==="startForm"||form.id==="resumeForm"){localStorage.setItem("htwSpeakAfterLoad",handsFree?"1":"0");setOrbState("thinking","Thinking","Analyzing the evidence and deciding the safest next diagnostic step.","Analyzing evidence…");for(const btn of form.querySelectorAll("button[type=submit]")){btn.disabled=true;btn.textContent="Working…";}}});}
-document.addEventListener("DOMContentLoaded",()=>{updateHandsFreeButton();const support=document.getElementById("voiceSupport");support.textContent=SpeechRecognition?"Tap the microphone to speak; spoken instructions can continue hands-free.":"Spoken instructions are available. Voice input depends on browser support.";if(navigator.permissions&&navigator.permissions.query){const baseNote=support.textContent;navigator.permissions.query({name:"microphone"}).then(p=>{const show=()=>{support.textContent=baseNote+" Microphone permission: "+p.state+".";};show();p.onchange=show;}).catch(()=>{});}const sub=document.getElementById("orbSub");if(sub)sub.dataset.base=sub.textContent;if(document.querySelector(".card.error"))setOrbState("error","Error");const errCard=document.getElementById("errorCard");if(errCard)errCard.focus({preventScroll:true});const shouldSpeak=localStorage.getItem("htwSpeakAfterLoad")==="1";localStorage.removeItem("htwSpeakAfterLoad");if(shouldSpeak&&handsFree)setTimeout(speakCurrent,350);});
+document.addEventListener("DOMContentLoaded",()=>{updateHandsFreeButton();document.body.classList.add("js");const drawer=document.querySelector(".drawer");if(drawer&&window.matchMedia){const mq=window.matchMedia("(min-width:1024px)");const syncDrawer=()=>{if(mq.matches)drawer.open=true;};syncDrawer();if(mq.addEventListener)mq.addEventListener("change",syncDrawer);}const support=document.getElementById("voiceSupport");support.textContent=SpeechRecognition?"Tap the microphone to speak; spoken instructions can continue hands-free.":"Spoken instructions are available. Voice input depends on browser support.";if(navigator.permissions&&navigator.permissions.query){const baseNote=support.textContent;navigator.permissions.query({name:"microphone"}).then(p=>{const show=()=>{support.textContent=baseNote+" Microphone permission: "+p.state+".";};show();p.onchange=show;}).catch(()=>{});}const sub=document.getElementById("orbSub");if(sub)sub.dataset.base=sub.textContent;if(document.querySelector(".card.error"))setOrbState("error","Error");if(document.querySelector(".card.final"))document.body.classList.add("completed");const errCard=document.getElementById("errorCard");if(errCard)errCard.focus({preventScroll:true});const shouldSpeak=localStorage.getItem("htwSpeakAfterLoad")==="1";localStorage.removeItem("htwSpeakAfterLoad");if(shouldSpeak&&handsFree)setTimeout(speakCurrent,350);});
 </script>
 </body>
 </html>
@@ -236,41 +296,65 @@ def _record_error(exc):
     STATE["error"] = _friendly_error(exc)
 
 
+def _append_entry(kind, glyph, title, detail, record=None):
+    """Append one timeline entry to memory and to durable history."""
+    STATE["timeline"].append(
+        {"glyph": glyph, "kind": kind, "title": title, "detail": detail, "record": record})
+    hid = STATE["history_session_id"]
+    if hid is not None:
+        get_store().record_event(hid, kind, glyph, title, detail, record)
+
+
 def _record_timeline(before, after, user_text=None):
     """Append factual entries derived from real snapshot diffs.
 
     `before` is None only for a fresh session start. Every entry quotes a
     real record id, user input, or model action; nothing is invented.
     """
-    log = STATE["timeline"]
     if user_text is not None:
-        log.append({"glyph": "◉", "title": "You reported", "detail": user_text})
+        _append_entry("user", "◉", "You reported", user_text)
     old_evidence = {item.id for item in before.evidence} if before is not None else set()
     old_status = {item.id: item.status for item in before.hypotheses} if before is not None else {}
     if before is None:
-        log.append({"glyph": "●", "title": "Session started", "detail": after.problem})
+        _append_entry("session", "●", "Session started", after.problem)
     else:
         for item in after.evidence:
             if item.id not in old_evidence:
-                log.append({"glyph": "▣", "title": f"Evidence recorded ({item.id})", "detail": item.statement})
+                _append_entry("evidence", "▣", f"Evidence recorded ({item.id})", item.statement, item.id)
     for hypo in after.hypotheses:
         if hypo.id not in old_status:
-            log.append({"glyph": "◇", "title": f"New cause considered ({hypo.id})", "detail": hypo.cause})
+            _append_entry("hypothesis", "◇", f"New cause considered ({hypo.id})", hypo.cause, hypo.id)
         elif hypo.status != old_status[hypo.id]:
-            log.append({"glyph": "↻", "title": f"Cause {hypo.id} is now {hypo.status}", "detail": hypo.rationale or hypo.cause})
+            _append_entry("update", "↻", f"Cause {hypo.id} is now {hypo.status}",
+                          hypo.rationale or hypo.cause, hypo.id)
     upcoming = after.next_action
     if upcoming is not None and (
         before is None or before.next_action is None or before.next_action.id != upcoming.id
     ):
-        log.append({"glyph": "▷", "title": "Test requested", "detail": upcoming.action})
+        _append_entry("test", "▷", "Test requested", upcoming.action, upcoming.id)
     if after.recommendation is not None and (before is None or before.recommendation is None):
-        log.append({"glyph": "✓", "title": "Verified recommendation", "detail": after.recommendation.action})
+        _append_entry("recommendation", "✓", "Verified recommendation",
+                      after.recommendation.action, after.recommendation.hypothesis_id)
     del STATE["timeline"][:-TIMELINE_LIMIT]
+
+
+def _record_photo_event(record_id):
+    """Note that a photo informed one round. Image bytes are never stored."""
+    _append_entry("photo", "◈", f"Photo attached ({record_id})",
+                  "Shown to the model for this round; image bytes are not stored.", record_id)
+    del STATE["timeline"][:-TIMELINE_LIMIT]
+
+
+def _recent_entries():
+    """Last two live timeline entries with 1-based positions for anchor links."""
+    tail = STATE["timeline"][-2:]
+    start = len(STATE["timeline"]) - len(tail) + 1
+    return [(start + index, entry) for index, entry in enumerate(tail)]
 
 
 def current_context():
     loop = STATE["loop"]
-    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"], "provider_label": STATE["provider_label"], "advance_note": STATE["advance_note"], "timeline": STATE["timeline"], "draft_problem": STATE["draft_problem"], "draft_answer": STATE["draft_answer"]}
+    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"], "provider_label": STATE["provider_label"], "advance_note": STATE["advance_note"], "timeline": STATE["timeline"], "draft_problem": STATE["draft_problem"], "draft_answer": STATE["draft_answer"], "sessions": get_store().list_sessions(), "viewing": None, "recents": _recent_entries()}
 
 
 @app.get("/")
@@ -314,12 +398,21 @@ def start():
         STATE["advance_note"] = None
         STATE["timeline"] = []
         STATE["draft_problem"] = ""
+        previous = STATE["history_session_id"]
+        if previous is not None:
+            get_store().archive_session(previous)
+        hid = loop.session.snapshot.id
+        count = len(get_store().list_sessions()) + 1
+        get_store().create_session(hid, f"Investigation {count} — {problem[:36]}", problem)
+        STATE["history_session_id"] = hid
         STATE["provider"] = provider
         STATE["provider_label"] = label
         STATE["images"] = {initial.record_id: image_data_url} if image_data_url else {}
         STATE["last_result"] = loop.run()
         STATE["error"] = _outcome_error(STATE["last_result"])
         _record_timeline(None, loop.session.snapshot)
+        if image_data_url:
+            _record_photo_event(initial.record_id)
     except (ValueError, Rejected, ProviderError) as exc:
         _record_error(exc)
         STATE["draft_problem"] = problem
@@ -361,6 +454,8 @@ def resume():
         )
         STATE["draft_answer"] = ""
         _record_timeline(before, loop.session.snapshot, user_text=answer)
+        if image_data_url:
+            _record_photo_event(ingested.record_id)
     except (ValueError, Rejected, ProviderError) as exc:
         _record_error(exc)
         STATE["draft_answer"] = answer
@@ -396,6 +491,9 @@ def retry():
 
 @app.post("/reset")
 def reset():
+    hid = STATE["history_session_id"]
+    if hid is not None:
+        get_store().archive_session(hid)
     STATE["loop"] = None
     STATE["last_result"] = None
     STATE["error"] = None
@@ -406,7 +504,38 @@ def reset():
     STATE["timeline"] = []
     STATE["draft_problem"] = ""
     STATE["draft_answer"] = ""
+    STATE["history_session_id"] = None
     return redirect(url_for("index"))
+
+
+@app.get("/history/<session_id>")
+def view_history(session_id):
+    session = get_store().get_session(session_id)
+    if session is None:
+        STATE["error"] = "Investigation not found."
+        return redirect(url_for("index"))
+    context = current_context()
+    context["viewing"] = {
+        "session": session, "events": get_store().get_events(session_id)}
+    return render_template_string(PAGE, **context)
+
+
+@app.post("/history/<session_id>/rename")
+def rename_history(session_id):
+    if get_store().get_session(session_id) is None:
+        STATE["error"] = "Investigation not found."
+        return redirect(url_for("index"))
+    name = (request.form.get("name") or "").strip()
+    if not name:
+        STATE["error"] = "Session name must not be empty."
+        return redirect(url_for("view_history", session_id=session_id))
+    try:
+        get_store().rename_session(session_id, name)
+    except ValueError as exc:
+        STATE["error"] = str(exc)
+        return redirect(url_for("view_history", session_id=session_id))
+    STATE["error"] = None
+    return redirect(url_for("view_history", session_id=session_id))
 
 
 if __name__ == "__main__":
