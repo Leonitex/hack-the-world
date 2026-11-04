@@ -493,5 +493,26 @@ class PhoneAppTests(unittest.TestCase):
         self.assertNotIn('class="recents"', body)
 
 
+    def test_history_drawer_markup(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn('<details class="drawer">', body)
+        self.assertIn("History & timeline", body)
+        self.assertIn(".drawer:not([open])", body)
+        self.assertNotIn('<details class="drawer" open', body)
+
+    def test_hypothesis_status_markers(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn('data-status="possible"', body)
+        self.assertIn('.hypothesis[data-status="supported"]', body)
+        self.assertIn('.hypothesis[data-status="eliminated"]', body)
+
+    def test_touch_and_type_polish(self):
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("touch-action:manipulation", body)
+        self.assertIn("line-height:1.5", body)
+
+
 if __name__ == "__main__":
     unittest.main()

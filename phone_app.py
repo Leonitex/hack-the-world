@@ -105,7 +105,7 @@ body.error .orb-spin-a circle { stroke:var(--bad); }
 .bubble .state { color:var(--accent); font-size:12px; font-weight:800; letter-spacing:.8px; text-transform:uppercase; margin-bottom:6px; }
 .bubble .message { font-size:18px; line-height:1.45; }
 .controls { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px,1fr)); gap:10px; max-width:640px; margin:0 auto 16px; }
-button { appearance:none; border:0; cursor:pointer; border-radius:12px; min-height:48px; padding:12px 14px; font-weight:700; font-size:15px; background:linear-gradient(135deg, #d8f5ff, #bbcbff); color:#0a1018; }
+button { appearance:none; border:0; cursor:pointer; touch-action:manipulation; border-radius:12px; min-height:48px; padding:12px 14px; font-weight:700; font-size:15px; background:linear-gradient(135deg, #d8f5ff, #bbcbff); color:#0a1018; }
 button.secondary { background:#121d2a; color:#dce9f7; border:1px solid #2a4058; }
 button.mic-active { background:linear-gradient(135deg, #c7ffe5, #a6e9ff); }
 button:disabled { opacity:.55; cursor:wait; }
@@ -170,6 +170,15 @@ body.completed .orb-spin-a circle { stroke:var(--good); }
 .recent-bubble span { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .recent-user { border-color:#2f5a4c; }
 .recent-user strong { color:var(--good); }
+body { line-height:1.5; }
+.drawer { border:0; padding:0; margin:0; }
+.drawer>summary { list-style:none; cursor:pointer; font-weight:800; color:#c9d9e8; background:rgba(13,20,30,.94); border:1px solid var(--line); border-radius:14px; padding:12px 14px; margin-bottom:10px; }
+.drawer>summary::-webkit-details-marker { display:none; }
+.drawer-body { display:grid; gap:14px; align-content:start; }
+@media (min-width:1024px) { .drawer>summary { display:none; } .drawer:not([open])>.drawer-body { display:grid; } }
+.hypothesis[data-status="supported"]::before,.hypothesis[data-status="confirmed"]::before { background:var(--good); }
+.hypothesis[data-status="weakened"]::before { background:#ffcf7d; }
+.hypothesis[data-status="eliminated"]::before { background:var(--bad); }
 @media (prefers-reduced-motion:reduce) { .orb-svg *, .orb-sweep, .card, .bubble, .recent-bubble, .bg-glow-a, .bg-glow-b, .orb-scanline { animation:none !important; } .orb-core, .orb-svg { transition:none; } .orb-scanline { opacity:0 !important; } }
 </style>
 </head>
@@ -205,8 +214,8 @@ body.completed .orb-spin-a circle { stroke:var(--good); }
 {% if session.recommendation %}<div class="card final"><h2>Verified recommendation</h2><p class="big-action">{{ session.recommendation.action }}</p><small>Grounded in {{ session.recommendation.evidence_ids|length }} recorded evidence item(s).</small></div>{% endif %}
 <form method="post" action="{{ url_for('reset') }}"><button type="submit" class="secondary" style="width:100%">Start a new investigation</button></form>
 </section>
-<section class="zone-timeline" aria-label="Investigation history">{% if sessions %}<div class="card sticky">{{ session_list("Investigations") }}</div>{% endif %}{% if timeline %}<div class="card"><h2>Timeline</h2><ol class="timeline">{% for entry in timeline %}<li class="t-event" id="t-{{ loop.index }}"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>{{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div></div></li>{% endfor %}</ol></div>{% endif %}</section>
-<section class="zone-tech" aria-label="Technical details"><div class="card sticky"><details><summary>Evidence & technical details</summary><h3>Evidence</h3>{% if session.evidence %}<div class="evidence-grid">{% for e in session.evidence %}<details class="evidence-chip"><summary><strong>{{ e.id.split(':')[-1] }}</strong> · {{ e.statement }}</summary><div class="muted">Source: {{ e.source }}</div>{% for pair in e.provenance %}<div class="muted">{{ pair[0] }}: {{ pair[1] }}</div>{% endfor %}</details>{% endfor %}</div>{% else %}<div class="muted">No evidence recorded yet.</div>{% endif %}<h3>Competing hypotheses</h3>{% if session.hypotheses %}{% for h in session.hypotheses %}<div class="hypothesis"><strong>{{ h.cause }}</strong><div class="badges"><span class="badge">{{ h.status }}</span></div>{% if h.rationale %}<small>{{ h.rationale }}</small>{% endif %}</div>{% endfor %}{% else %}<div class="muted">No cause proposed yet.</div>{% endif %}</details></div></section>
+<section class="zone-timeline" aria-label="Investigation history"><details class="drawer"><summary>History & timeline</summary><div class="drawer-body">{% if sessions %}<div class="card sticky">{{ session_list("Investigations") }}</div>{% endif %}{% if timeline %}<div class="card"><h2>Timeline</h2><ol class="timeline">{% for entry in timeline %}<li class="t-event" id="t-{{ loop.index }}"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>{{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div></div></li>{% endfor %}</ol></div>{% endif %}</div></details></section>
+<section class="zone-tech" aria-label="Technical details"><div class="card sticky"><details><summary>Evidence & technical details</summary><h3>Evidence</h3>{% if session.evidence %}<div class="evidence-grid">{% for e in session.evidence %}<details class="evidence-chip"><summary><strong>{{ e.id.split(':')[-1] }}</strong> · {{ e.statement }}</summary><div class="muted">Source: {{ e.source }}</div>{% for pair in e.provenance %}<div class="muted">{{ pair[0] }}: {{ pair[1] }}</div>{% endfor %}</details>{% endfor %}</div>{% else %}<div class="muted">No evidence recorded yet.</div>{% endif %}<h3>Competing hypotheses</h3>{% if session.hypotheses %}{% for h in session.hypotheses %}<div class="hypothesis" data-status="{{ h.status }}"><strong>{{ h.cause }}</strong><div class="badges"><span class="badge">{{ h.status }}</span></div>{% if h.rationale %}<small>{{ h.rationale }}</small>{% endif %}</div>{% endfor %}{% else %}<div class="muted">No cause proposed yet.</div>{% endif %}</details></div></section>
 </div>
 {% endif %}
 </main>
