@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import base64
-import mimetypes
 import os
 
 from flask import Flask, redirect, render_template_string, request, url_for
 
-from agent.baseten import BasetenMuseProvider
-from agent.loop import AgentLoop
+from agent.factory import create_provider
+from agent.loop import AgentLoop, LoopOutcome
+from agent.providers import ProviderError
 from diagnostic_core.engine import DiagnosticSession
 from diagnostic_core.models import Rejected
 
 app = Flask(__name__)
 
-STATE = {"loop": None, "last_result": None, "error": None}
+STATE = {"loop": None, "last_result": None, "error": None, "provider": None,
+         "provider_label": None, "images": {}}
 
 PAGE = r"""
 <!doctype html>
@@ -92,7 +93,7 @@ details[open] summary { margin-bottom:12px; }
 </head>
 <body class="idle">
 <main>
-<header><div class="brand">Hack the World</div><div class="meta">Meta Muse Spark Open</div></header>
+<header><div class="brand">Hack the World</div><div class="meta">{{ provider_label or "Meta Muse" }}</div></header>
 <section class="hero">
 <div class="orb-wrap" aria-label="Assistant status"><div class="orb-halo"></div><div class="orb-scan"></div><div class="orb-ring"></div><div class="orb-core"></div><div class="orb-label" id="orbLabel">Ready</div></div>
 <div class="bubble" id="assistantBubble"><div class="state" id="assistantState">{% if error %}Attention{% elif session and session.recommendation %}Verified{% elif session and session.next_action %}Next diagnostic step{% elif session %}Investigating{% else %}Ready{% endif %}</div><div class="message" id="assistantMessage">{% if error %}{{ error }}{% elif session and session.recommendation %}{{ session.recommendation.action }}{% elif session and session.next_action %}{{ session.next_action.action }}{% elif session %}I am reviewing the evidence and testing competing causes.{% else %}Tell me what the device is doing. You can speak, type, or add a photo.{% endif %}</div></div>
@@ -100,11 +101,12 @@ details[open] summary { margin-bottom:12px; }
 <div class="voice-note" id="voiceSupport"></div>
 </section>
 {% if error %}<div class="card error"><strong>Something needs attention</strong><div>{{ error }}</div></div>{% endif %}
+{% if result and (result.outcome.value == "provider_error" or result.outcome.value == "budget_exhausted") %}<form method="post" action="{{ url_for('retry') }}"><button type="submit" class="secondary" style="width:100%">Try again</button></form>{% endif %}
 {% if not session %}
 <div class="card"><form id="startForm" method="post" action="{{ url_for('start') }}" enctype="multipart/form-data"><label>Describe the problem</label><textarea id="problemInput" name="problem" required placeholder="Example: Laptop powers on, fan spins, but the screen stays black."></textarea><div class="controls" style="margin:10px 0 4px"><button type="button" class="secondary" onclick="startDictation('problemInput', this)">🎙 Speak symptoms</button><button type="button" class="secondary" onclick="document.getElementById('imageInput').click()">📷 Add photo</button></div><div class="filebox"><input id="imageInput" type="file" name="image" accept="image/*" capture="environment"><small>A clear device photo is optional, but makes the demo visibly multimodal.</small></div><button type="submit" style="width:100%;margin-top:12px">Begin investigation</button></form></div>
 {% else %}
 <div class="card"><div class="badges"><span class="badge">{{ session.status }}</span><span class="badge">{{ session.turn_count }} diagnostic turns</span><span class="badge">{{ result.steps_used if result else 0 }} Muse steps</span></div><div class="progress"><div class="step done">Observe</div><div class="step {% if session.hypotheses %}done{% else %}active{% endif %}">Hypothesize</div><div class="step {% if session.next_action %}active{% elif session.recommendation %}done{% endif %}">Test</div><div class="step {% if session.recommendation %}done{% elif session.hypotheses and not session.next_action %}active{% endif %}">Verify</div><div class="step {% if session.recommendation %}active{% endif %}">Fix</div></div><h3 style="margin-top:16px">Device problem</h3><div>{{ session.problem }}</div></div>
-{% if session.next_action %}<div class="card next"><h2>Do this next</h2><p style="font-size:18px;line-height:1.45"><strong>{{ session.next_action.action }}</strong></p>{% if session.next_action.observations %}<div class="muted">Report:</div><ul>{% for o in session.next_action.observations %}<li>{{ o }}</li>{% endfor %}</ul>{% endif %}<form id="resumeForm" method="post" action="{{ url_for('resume') }}"><label>What happened?</label><textarea id="answerInput" name="answer" required placeholder="Tell me exactly what you observed."></textarea><div class="controls" style="margin:10px 0 0"><button type="button" id="answerMic" class="secondary" onclick="startDictation('answerInput', this)">🎙 Speak result</button><button type="submit">Submit & continue</button></div></form></div>{% endif %}
+{% if session.next_action %}<div class="card next"><h2>Do this next</h2><p style="font-size:18px;line-height:1.45"><strong>{{ session.next_action.action }}</strong></p>{% if session.next_action.observations %}<div class="muted">Report:</div><ul>{% for o in session.next_action.observations %}<li>{{ o }}</li>{% endfor %}</ul>{% endif %}<form id="resumeForm" method="post" action="{{ url_for('resume') }}" enctype="multipart/form-data"><label>What happened?</label><textarea id="answerInput" name="answer" required placeholder="Tell me exactly what you observed."></textarea><div class="filebox" style="margin-top:10px"><input id="answerImageInput" type="file" name="image" accept="image/*" capture="environment"><small>Optional follow-up photo of what you observed.</small></div><div class="controls" style="margin:10px 0 0"><button type="button" id="answerMic" class="secondary" onclick="startDictation('answerInput', this)">🎙 Speak result</button><button type="submit">Submit & continue</button></div></form></div>{% endif %}
 {% if session.recommendation %}<div class="card final"><h2>✓ Verified recommendation</h2><p style="font-size:18px;line-height:1.45">{{ session.recommendation.action }}</p><small>Grounded in {{ session.recommendation.evidence_ids|length }} recorded evidence item(s).</small></div>{% endif %}
 <details class="card"><summary>Evidence & technical details</summary><h3>Evidence</h3>{% if session.evidence %}<div class="evidence-grid">{% for e in session.evidence %}<div class="evidence-chip"><strong>{{ e.id.split(':')[-1] }}</strong> · {{ e.statement }}</div>{% endfor %}</div>{% else %}<div class="muted">No evidence recorded yet.</div>{% endif %}<h3 style="margin-top:18px">Competing hypotheses</h3>{% if session.hypotheses %}{% for h in session.hypotheses %}<div class="hypothesis"><strong>{{ h.cause }}</strong><div class="badges"><span class="badge">{{ h.status }}</span></div>{% if h.rationale %}<small>{{ h.rationale }}</small>{% endif %}</div>{% endfor %}{% else %}<div class="muted">No cause proposed yet.</div>{% endif %}</details>
 <form method="post" action="{{ url_for('reset') }}"><button type="submit" class="secondary" style="width:100%">Start a new investigation</button></form>
@@ -131,27 +133,81 @@ document.addEventListener("DOMContentLoaded",()=>{updateHandsFreeButton();const 
 """
 
 
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
+
+
+def _require_image_mime(data):
+    """Return the image MIME type for recognized content, else raise ValueError."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    raise ValueError("Photo content is not a recognized image.")
+
+
 def image_to_data_url(upload):
     if not upload or not upload.filename:
         return None
+    filename = upload.filename or ""
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if extension not in ALLOWED_IMAGE_EXTENSIONS:
+        raise ValueError("Photo must be a PNG, JPEG, GIF, WebP, or BMP image.")
     data = upload.read()
     if not data:
         return None
-    if len(data) > 8 * 1024 * 1024:
+    if len(data) > MAX_IMAGE_BYTES:
         raise ValueError("Please use an image smaller than 8 MB for the demo.")
-    mime = upload.mimetype or mimetypes.guess_type(upload.filename)[0] or "image/jpeg"
+    mime = _require_image_mime(data)
     encoded = base64.b64encode(data).decode("ascii")
     return f"data:{mime};base64,{encoded}"
 
 
+def _friendly_error(exc):
+    """Browser-safe message: config guidance shown, API payloads withheld."""
+    text = str(exc)
+    if "API key" in text or "_API_KEY" in text or "HTW_PROVIDER" in text:
+        return text
+    if isinstance(exc, ProviderError):
+        return "The diagnostic service had trouble reaching the model. The session is preserved; try again."
+    if isinstance(exc, Rejected):
+        return f"Evidence rejected: {exc}"
+    return text
+
+
+def _record_error(exc):
+    """Full detail goes to the server console only; browser gets safe text."""
+    print(f"[phone_app] {type(exc).__name__}: {exc}", flush=True)
+    STATE["error"] = _friendly_error(exc)
+
+
 def current_context():
     loop = STATE["loop"]
-    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"]}
+    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"], "provider_label": STATE["provider_label"]}
 
 
 @app.get("/")
 def index():
     return render_template_string(PAGE, **current_context())
+
+
+def _outcome_error(result):
+    """Browser-safe message for terminal loop outcomes; None when on track."""
+    if result is None:
+        return None
+    if result.outcome in (LoopOutcome.NEEDS_INPUT, LoopOutcome.COMPLETED):
+        return None
+    if result.outcome is LoopOutcome.PAUSED:
+        return f"Diagnosis paused ({result.session.pause_reason}). Start a new investigation to continue."
+    if result.outcome is LoopOutcome.PROVIDER_ERROR:
+        return "The diagnostic service had trouble reaching the model. You can try again."
+    return "The assistant ran out of steps. You can try again to continue."
 
 
 @app.post("/start")
@@ -164,15 +220,23 @@ def start():
     try:
         image_data_url = image_to_data_url(request.files.get("image"))
         session = DiagnosticSession(problem, max_turns=30, max_completion_attempts=3)
-        session.execute("record_evidence", {"source": "user_text", "statement": problem, "provenance": {"channel": "phone_ui", "kind": "initial_problem"}})
-        provider = BasetenMuseProvider(image_data_url=image_data_url)
+        initial = session.execute("record_evidence", {"source": "user_text", "statement": problem, "provenance": {"channel": "phone_ui", "kind": "initial_problem"}})
+        provider, label = create_provider(image_data_url)
         loop = AgentLoop(session, provider, max_provider_steps=14)
         STATE["loop"] = loop
+        STATE["provider"] = provider
+        STATE["provider_label"] = label
+        STATE["images"] = {initial.record_id: image_data_url} if image_data_url else {}
         STATE["last_result"] = loop.run()
-    except Exception as exc:
+        STATE["error"] = _outcome_error(STATE["last_result"])
+    except (ValueError, Rejected, ProviderError) as exc:
+        _record_error(exc)
         STATE["loop"] = None
         STATE["last_result"] = None
-        STATE["error"] = str(exc)
+    except Exception:  # noqa: BLE001 - demo surface reports failures inline
+        STATE["loop"] = None
+        STATE["last_result"] = None
+        STATE["error"] = "Unexpected failure starting the session. Please try again."
     return redirect(url_for("index"))
 
 
@@ -187,12 +251,41 @@ def resume():
         STATE["error"] = "Report what you observed before continuing."
         return redirect(url_for("index"))
     try:
-        loop.resume_with_result(answer, {"channel": "phone_ui", "kind": "diagnostic_observation"})
+        image_data_url = image_to_data_url(request.files.get("image"))
+        result = loop.resume_with_result(answer, {"channel": "phone_ui", "kind": "diagnostic_observation"})
+        if image_data_url:
+            STATE["images"][result.record_id] = image_data_url
+            if STATE["provider"] is not None:
+                STATE["provider"].set_image(image_data_url)
         STATE["last_result"] = loop.run()
-    except Rejected as exc:
-        STATE["error"] = f"Evidence rejected: {exc}"
-    except Exception as exc:
-        STATE["error"] = str(exc)
+        STATE["error"] = _outcome_error(STATE["last_result"])
+    except (ValueError, Rejected, ProviderError) as exc:
+        _record_error(exc)
+    except Exception:  # noqa: BLE001 - demo surface reports failures inline
+        STATE["loop"] = None
+        STATE["last_result"] = None
+        STATE["error"] = "Unexpected failure while resuming. Please restart the diagnosis."
+    return redirect(url_for("index"))
+
+
+@app.post("/retry")
+def retry():
+    STATE["error"] = None
+    loop = STATE["loop"]
+    provider = STATE["provider"]
+    if loop is None or provider is None:
+        return redirect(url_for("index"))
+    try:
+        fresh = AgentLoop(loop.session, provider, max_provider_steps=14)
+        STATE["loop"] = fresh
+        STATE["last_result"] = fresh.run()
+        STATE["error"] = _outcome_error(STATE["last_result"])
+    except (ValueError, Rejected, ProviderError) as exc:
+        _record_error(exc)
+    except Exception:  # noqa: BLE001 - demo surface reports failures inline
+        STATE["loop"] = None
+        STATE["last_result"] = None
+        STATE["error"] = "Unexpected failure while retrying. Please restart the diagnosis."
     return redirect(url_for("index"))
 
 
@@ -201,9 +294,13 @@ def reset():
     STATE["loop"] = None
     STATE["last_result"] = None
     STATE["error"] = None
+    STATE["provider"] = None
+    STATE["provider_label"] = None
+    STATE["images"] = {}
     return redirect(url_for("index"))
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    host = (os.environ.get("HTW_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    app.run(host=host, port=port, debug=False)

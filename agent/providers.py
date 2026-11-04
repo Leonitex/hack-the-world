@@ -60,6 +60,9 @@ class Provider:
     def decide(self, request: ProviderRequest) -> ProviderDecision:
         raise NotImplementedError
 
+    def set_image(self, image_data_url):
+        """Attach a photo for later decisions. Vision-capable providers override."""
+
 
 class FakeProvider(Provider):
     """Deterministic scripted provider for tests. No IO, no network.

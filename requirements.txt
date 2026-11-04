@@ -1,1 +1,4 @@
 Flask>=3.0,<4
+# Live Meta Model API route only (Baseten route uses stdlib urllib).
+# The default test suite needs nothing beyond Flask + stdlib.
+openai>=1.0.0

@@ -74,6 +74,10 @@ class BasetenMuseProvider(Provider):
         self._model = model
         self._timeout = timeout
 
+    def set_image(self, image_data_url):
+        """Attach or replace the photo the model sees on later decisions."""
+        self._image_data_url = image_data_url
+
     def decide(self, request):
         tools = [{"type": "function", "function": tool} for tool in request.tools]
 
@@ -115,7 +119,7 @@ class BasetenMuseProvider(Provider):
             "tool_choice": "required",
             "parallel_tool_calls": False,
             "temperature": 0.2,
-            "max_tokens": 1200,
+            "max_tokens": 2000,
         }
 
         http_request = urllib.request.Request(
@@ -140,6 +144,11 @@ class BasetenMuseProvider(Provider):
             raise ProviderError(f"Baseten response error: {exc}") from exc
 
         try:
+            if body["choices"][0].get("finish_reason") == "length":
+                raise ProviderError(
+                    "Muse Spark Open truncated the reply (finish_reason=length); "
+                    "the token budget was exhausted before a tool call completed."
+                )
             message = body["choices"][0]["message"]
             raw_calls = message.get("tool_calls") or []
             calls = []
@@ -149,7 +158,7 @@ class BasetenMuseProvider(Provider):
                 if isinstance(arguments, str):
                     arguments = json.loads(arguments)
                 calls.append(ToolCall(function["name"], arguments))
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        except (KeyError, IndexError, TypeError, AttributeError, json.JSONDecodeError) as exc:
             raise ProviderError(
                 "Muse Spark Open returned an unusable tool-call response"
             ) from exc
