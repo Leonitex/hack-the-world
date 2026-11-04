@@ -16,11 +16,15 @@ is passed only to the SDK client constructor and never logged, rendered,
 returned, or embedded in requests.
 
 Meta supports only tool_choice "auto", so a reply may carry zero calls
-(plain text) or, despite parallel_tool_calls=False, several. Zero calls
-become an empty decision and multiple calls pass through untouched; both
-reach the loop's existing structural handling and none execute except
-through the normal single-call path. Any accompanying plain-text content
-is dropped, never surfaced. API and response-integrity failures become ProviderError. HTTP status errors
+(plain text) or, despite parallel_tool_calls=False, several. A text-only
+reply is retried against a bounded reinstruction (default two retries);
+if the model still returns no tool call, decide() raises ProviderError
+carrying the attempt count and last finish_reason instead of returning
+an empty decision that would burn loop steps without progress. Multiple
+calls pass through untouched to the loop's structural handling and none
+execute except through the normal single-call path. Any accompanying
+plain-text content is dropped, never surfaced as evidence or executed.
+API and response-integrity failures become ProviderError. HTTP status errors
 surface only the status code plus the Meta message/type/param/code fields;
 headers, request metadata, and full bodies never surface. The adapter never
 touches DiagnosticSession.
@@ -82,6 +86,21 @@ DEVELOPER_INSTRUCTION = (
     "Submit a recommendation only when a hypothesis is sufficiently "
     "supported by cited session evidence."
 )
+
+
+EMPTY_REPLY_REINSTRUCTION = (
+    "Your last reply contained no tool call. Respond now with exactly one "
+    "tool call using the supplied tools and exact arguments. Never answer "
+    "in plain text."
+)
+
+
+def _finish_reason(response):
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return None
+    reason = getattr(choices[0], "finish_reason", None)
+    return reason if isinstance(reason, str) and reason else None
 
 
 def to_openai_tool(tool):
@@ -227,10 +246,13 @@ class MetaProvider(Provider):
     """
 
     def __init__(self, *, api_key=None, model=None, base_url=None, client=None, timeout=None,
-                 image_data_url=None):
+                 image_data_url=None, max_empty_retries=2):
         self._model = model or os.environ.get("META_MODEL_ID") or DEFAULT_MODEL_ID
         self._base_url = base_url or os.environ.get("META_BASE_URL") or DEFAULT_BASE_URL
         self._image_data_url = image_data_url
+        if type(max_empty_retries) is not int or max_empty_retries < 0:
+            raise ProviderError("max_empty_retries must be a non-negative integer")
+        self._max_empty_retries = max_empty_retries
         if client is None:
             if OpenAI is None:
                 raise ProviderError(
@@ -264,12 +286,32 @@ class MetaProvider(Provider):
 
     def decide(self, request):
         tools = [to_openai_tool(tool) for tool in request.tools]
-        messages = [
+        base_messages = [
             {"role": "developer", "content": DEVELOPER_INSTRUCTION},
             {"role": "user", "content": self._user_content(request)},
         ]
+        attempts = 1 + self._max_empty_retries
+        finish_reason = None
+        for attempt in range(attempts):
+            if attempt == 0:
+                messages = base_messages
+            else:
+                messages = base_messages + [
+                    {"role": "user", "content": EMPTY_REPLY_REINSTRUCTION},
+                ]
+            response = self._create(messages, tools)
+            decision = self._translate(response)
+            if decision.calls:
+                return decision
+            finish_reason = _finish_reason(response)
+        detail = f"Meta API returned no tool call after {attempts} attempts"
+        if finish_reason:
+            detail += f" (last finish_reason={finish_reason})"
+        raise ProviderError(detail + ": the model answered in plain text; retry the step.")
+
+    def _create(self, messages, tools):
         try:
-            response = self._client.chat.completions.create(
+            return self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
                 tools=tools,
@@ -300,7 +342,6 @@ class MetaProvider(Provider):
             raise ProviderError(_format_status_error("request failed", exc)) from exc
         except OpenAIError as exc:
             raise ProviderError("Meta API failure.") from exc
-        return self._translate(response)
 
     def _user_content(self, request):
         state_text = render_state(request)

@@ -168,15 +168,19 @@ class PhoneAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(phone_app.STATE["loop"])
 
-    def test_retry_continues_with_fresh_budget(self):
+    def test_retry_continues_same_session_with_fresh_advance(self):
         _, fake = self.start_session(script=[propose_cause(), ProviderError("boom")])
         self.assertEqual(phone_app.STATE["last_result"].outcome, LoopOutcome.PROVIDER_ERROR)
+        session_id = phone_app.STATE["loop"].session.snapshot.id
+        self.assertEqual(phone_app.STATE["last_result"].steps_used, 14)
         fake.stage(propose_cause("Cause B"), request_evidence())
         response = self.client.post("/retry", follow_redirects=True)
         self.assertIn("Do this next", response.get_data(as_text=True))
         snapshot = phone_app.STATE["loop"].session.snapshot
+        self.assertEqual(snapshot.id, session_id)
         self.assertEqual(len(snapshot.hypotheses), 2)
         self.assertEqual(snapshot.turn_count, 4)
+        self.assertEqual(phone_app.STATE["last_result"].steps_used, 16)
 
     def test_orb_error_and_accessibility_hooks_present(self):
         body = self.client.get("/").get_data(as_text=True)
@@ -209,6 +213,134 @@ class PhoneAppTests(unittest.TestCase):
         self.assertIsNone(phone_app.STATE["loop"])
         self.assertIsNone(phone_app.STATE["provider"])
         self.assertEqual(phone_app.STATE["images"], {})
+
+
+    def test_resume_continues_after_start_consumes_advance(self):
+        # Issue #6 repro: the start phase may spend its whole advance, but
+        # Submit & continue must still reach a new actionable step.
+        script = [propose_cause(f"Cause {index}") for index in range(13)]
+        script.append(request_evidence())
+        response, fake = self.start_session(script=script)
+        self.assertIn("Do this next", response.get_data(as_text=True))
+        self.assertEqual(phone_app.STATE["last_result"].outcome, LoopOutcome.NEEDS_INPUT)
+        calls_before = fake.decide_calls
+        fake.stage(propose_cause("Cause after resume"), request_evidence())
+        response = self.client.post(
+            "/resume", data={"answer": "The indicator light is steady green."},
+            follow_redirects=True,
+        )
+        body = response.get_data(as_text=True)
+        self.assertGreater(fake.decide_calls, calls_before)
+        self.assertEqual(phone_app.STATE["last_result"].outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertIn("Do this next", body)
+
+    def test_second_and_third_user_turns_keep_progressing(self):
+        _, fake = self.start_session(script=[propose_cause(), request_evidence()])
+        for turn in ("First observation recorded.", "Second observation recorded."):
+            fake.stage(propose_cause(f"Cause for {turn}"), request_evidence())
+            response = self.client.post(
+                "/resume", data={"answer": turn}, follow_redirects=True)
+            self.assertIn("Do this next", response.get_data(as_text=True))
+            self.assertEqual(
+                phone_app.STATE["last_result"].outcome, LoopOutcome.NEEDS_INPUT)
+        session = phone_app.STATE["loop"].session.snapshot
+        self.assertEqual(len(session.evidence), 3)
+        self.assertGreaterEqual(len(session.hypotheses), 3)
+
+
+    def test_resume_shows_reassessment_note(self):
+        _, fake = self.start_session(script=[propose_cause(), request_evidence()])
+        fake.stage(propose_cause("Cause B"), request_evidence())
+        response = self.client.post(
+            "/resume", data={"answer": "The light is steady green."},
+            follow_redirects=True,
+        )
+        body = response.get_data(as_text=True)
+        self.assertIn("New evidence recorded", body)
+        self.assertIn("reassessed", body)
+        self.assertIn("2 steps this round", body)
+
+    def test_session_budget_exhaustion_asks_for_fresh_start(self):
+        _, fake = self.start_session(script=["garbage"] * 60)
+        self.assertEqual(
+            phone_app.STATE["last_result"].outcome, LoopOutcome.ADVANCE_EXHAUSTED)
+        for _ in range(4):
+            self.client.post("/retry", follow_redirects=True)
+        result = phone_app.STATE["last_result"]
+        self.assertEqual(result.outcome, LoopOutcome.BUDGET_EXHAUSTED)
+        self.assertEqual(fake.decide_calls, 60)
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("full step budget", body)
+        self.assertNotIn("Try again", body)
+        self.client.post("/retry", follow_redirects=True)
+        self.assertEqual(fake.decide_calls, 60)
+        self.assertEqual(phone_app.STATE["loop"].session.snapshot.turn_count, 1)
+
+
+    def test_timeline_records_real_events(self):
+        response, fake = self.start_session(script=[propose_cause(), request_evidence()])
+        body = response.get_data(as_text=True)
+        self.assertIn("Session started", body)
+        self.assertIn("New cause considered", body)
+        self.assertIn("Test requested", body)
+        titles = [entry["title"] for entry in phone_app.STATE["timeline"]]
+        self.assertEqual(titles[0], "Session started")
+        self.assertTrue(titles[1].startswith("New cause considered ("))
+        self.assertEqual(titles[2], "Test requested")
+        fake.stage(propose_cause("Cause B"), request_evidence())
+        response = self.client.post(
+            "/resume", data={"answer": "The light is steady green."},
+            follow_redirects=True,
+        )
+        body = response.get_data(as_text=True)
+        titles = [entry["title"] for entry in phone_app.STATE["timeline"]]
+        self.assertIn("You reported", titles)
+        self.assertIn("The light is steady green.", body)
+        recorded = [title for title in titles if title.startswith("Evidence recorded (")]
+        self.assertEqual(len(recorded), 1)
+        resumed = phone_app.STATE["loop"].session.snapshot
+        self.assertIn(resumed.evidence[-1].id, recorded[0])
+        self.assertIn("Cause B", body)
+
+    def test_premium_assistant_hooks_present(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn('<svg class="orb-svg"', body)
+        self.assertIn("orbCoreError", body)
+        self.assertIn("orb-sweep", body)
+        self.assertIn('id="orbSub"', body)
+        self.assertIn("zone-assistant", body)
+        self.assertIn("zone-timeline", body)
+        self.assertIn("zone-tech", body)
+        self.assertIn('id="stopButton"', body)
+        self.assertIn("dataset.submitted", body)
+        self.assertIn('charset="utf-8"', body)
+        self.assertIn("grid-template-areas", body)
+
+    def test_draft_problem_preserved_on_start_error(self):
+        problem = "Laptop powers on but the screen stays black"
+        with patch("phone_app.create_provider", side_effect=ProviderError("No provider key found.")):
+            response = self.client.post("/start", data={"problem": problem}, follow_redirects=True)
+        body = response.get_data(as_text=True)
+        self.assertIn("Something needs attention", body)
+        self.assertIn(problem, body)
+        self.assertIn("Begin investigation", body)
+
+    def test_draft_answer_preserved_on_photo_error(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        answer = "The light is amber and blinking."
+        response = self.client.post(
+            "/resume",
+            data={"answer": answer, "image": (io.BytesIO(b"not an image"), "evil.exe")},
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        body = response.get_data(as_text=True)
+        self.assertIn("PNG, JPEG, GIF, WebP, or BMP", body)
+        self.assertIn(answer, body)
+        loop = phone_app.STATE["loop"]
+        self.assertIsNotNone(loop)
+        self.assertEqual(loop.session.snapshot.status, S.NEEDS_INPUT)
 
 
 if __name__ == "__main__":

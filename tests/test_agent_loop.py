@@ -396,6 +396,9 @@ class AgentLoopTests(unittest.TestCase):
         for budget in (0, -1, True, 1.5, "3"):
             with self.subTest(budget=budget), self.assertRaises(Rejected):
                 AgentLoop(self.core, provider, max_provider_steps=budget)
+        for budget in (0, -1, True, 1.5, "3"):
+            with self.subTest(budget=budget), self.assertRaises(Rejected):
+                AgentLoop(self.core, provider, max_advance_steps=budget)
 
     def test_no_scenario_logic_in_agent_code(self):
         root = Path(__file__).resolve().parent.parent / "agent"
@@ -523,6 +526,87 @@ class AgentLoopTests(unittest.TestCase):
     def test_network_guard_is_active(self):
         with self.assertRaisesRegex(AssertionError, "Network access forbidden"):
             socket.create_connection(("localhost", 1))
+
+
+    def test_session_cap_still_bounds_total_steps(self):
+        # Pinning lifetime-cap semantics: with the whole session budget
+        # spent, a further run() must stop without new provider calls.
+        core = DiagnosticSession(PROBLEM)
+        provider = FakeProvider([
+            ToolCall("propose_hypothesis", {"cause": "Cause A"}),
+            ToolCall("request_user_evidence", request_args()),
+            ToolCall("propose_hypothesis", {"cause": "Cause B"}),
+        ])
+        loop = AgentLoop(core, provider, max_provider_steps=2)
+        first = loop.run()
+        self.assertEqual(first.outcome, LoopOutcome.NEEDS_INPUT)
+        loop.resume_with_result("Recorded outcome", {"reporter": "user"})
+        calls_before = provider.decide_calls
+        second = loop.run()
+        self.assertEqual(second.outcome, LoopOutcome.BUDGET_EXHAUSTED)
+        self.assertEqual(provider.decide_calls, calls_before)
+
+    def test_resume_grants_fresh_advance_allowance(self):
+        # Regression test for issue #6: a real user result must grant a
+        # fresh bounded decision allowance within the session-wide cap.
+        core = DiagnosticSession(PROBLEM)
+        provider = FakeProvider([
+            ToolCall("propose_hypothesis", {"cause": "Cause A"}),
+            ToolCall("request_user_evidence", request_args()),
+            ToolCall("propose_hypothesis", {"cause": "Cause B"}),
+            ToolCall("request_diagnostic_test", request_args()),
+        ])
+        loop = AgentLoop(core, provider, max_provider_steps=8, max_advance_steps=2)
+        first = loop.run()
+        self.assertEqual(first.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertEqual(provider.decide_calls, 2)
+        self.assertEqual(first.advance_steps, 2)
+        loop.resume_with_result("Recorded outcome", {"reporter": "user"})
+        second = loop.run()
+        self.assertEqual(second.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertEqual(provider.decide_calls, 4)
+        self.assertEqual(second.advance_steps, 2)
+        self.assertEqual(loop.steps_used, 4)
+        self.assertEqual(second.session.evidence[-1].statement, "Recorded outcome")
+        self.assertEqual(len(second.session.hypotheses), 2)
+
+    def test_advance_allowance_exhaustion_is_recoverable(self):
+        # Spending one advance mid-investigation stops that run() but the
+        # same loop can explicitly continue within the session cap.
+        core = DiagnosticSession(PROBLEM)
+        self.seed(core=core)
+        provider = FakeProvider([
+            ToolCall("propose_hypothesis", {"cause": "Cause A"}),
+            ToolCall("propose_hypothesis", {"cause": "Cause B"}),
+            ToolCall("request_user_evidence", request_args()),
+        ])
+        loop = AgentLoop(core, provider, max_provider_steps=8, max_advance_steps=1)
+        first = loop.run()
+        self.assertEqual(first.outcome, LoopOutcome.ADVANCE_EXHAUSTED)
+        self.assertEqual(first.advance_steps, 1)
+        self.assertEqual(provider.decide_calls, 1)
+        second = loop.run()
+        self.assertEqual(second.outcome, LoopOutcome.ADVANCE_EXHAUSTED)
+        self.assertEqual(provider.decide_calls, 2)
+        third = loop.run()
+        self.assertEqual(third.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertEqual(provider.decide_calls, 3)
+        self.assertEqual(loop.steps_used, 3)
+
+
+    def test_persistent_structural_failures_bounded_by_both_budgets(self):
+        provider = FakeProvider(["garbage"] * 20)
+        loop = AgentLoop(self.core, provider, max_provider_steps=5, max_advance_steps=2)
+        first = loop.run()
+        self.assertEqual(first.outcome, LoopOutcome.ADVANCE_EXHAUSTED)
+        self.assertEqual(provider.decide_calls, 2)
+        second = loop.run()
+        self.assertEqual(second.outcome, LoopOutcome.ADVANCE_EXHAUSTED)
+        self.assertEqual(provider.decide_calls, 4)
+        third = loop.run()
+        self.assertEqual(third.outcome, LoopOutcome.BUDGET_EXHAUSTED)
+        self.assertEqual(provider.decide_calls, 5)
+        self.assertEqual(self.core.snapshot.turn_count, 0)
 
 
 if __name__ == "__main__":
