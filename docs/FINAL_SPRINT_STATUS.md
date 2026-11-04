@@ -59,4 +59,37 @@ Tests: 136 total green (`test_phone_app` 15, +2 M4 UI pins). Manual
 acceptance still required: full device conversation, PC-browser cycle
 with image upload, model-chosen next test spoken end to end.
 
-## M5 — Test, polish, and demo handoff: PENDING
+## M5 — Test, polish, and demo handoff: DONE (code + docs; live/manual acceptance remains)
+
+Polish: `.env.example` documents the exact supported surface
+(`HTW_PROVIDER`, `MODEL_API_KEY`, `META_MODEL_API_KEY`, `META_MODEL_ID`,
+`META_BASE_URL`, `BASETEN_API_KEY`, `HTW_HOST`, `PORT`) and drops dead
+Modal/Fireworks entries; `docs/phone-mvp.md` gains the provider-selection
+note and a branch-durable clone command. No code changes in M5.
+
+Final validation: 136 tests green
+(`test_core` 45, `test_agent_loop` 31, `test_meta_provider` 25,
+`test_baseten_provider` 12, `test_factory` 8, `test_phone_app` 15),
+`compileall` clean, `git diff --check` clean, zero `SyntaxWarning`s.
+`diagnostic_core/` untouched since the Milestone 2A checkpoint.
+
+Launch for the final manual test (PowerShell):
+
+```powershell
+cd C:\Users\Scott\hack-the-world
+git checkout work/final-hackathon-sprint
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+$env:BASETEN_API_KEY = "<hackathon key>"   # or MODEL_API_KEY + HTW_PROVIDER=meta
+python phone_app.py
+# open http://127.0.0.1:8000
+```
+
+Manual acceptance still required: live provider smoke (no credential in
+automation env), full device conversation, PC-browser cycle with image
+upload, model-chosen next test spoken end to end, three-minute demo
+recording per `docs/demo-plan.md`.
+
+Blockers: none in code. Live Meta tool-loop compatibility is still
+unverified (Baseten is the reliable demo default); `gh` CLI is not
+installed, so the PR is opened via the web UI.

@@ -17,7 +17,7 @@ The model proposes actions, but the diagnostic core owns authoritative state and
 ## Setup
 
 ```bash
-git clone -b work/phone-mvp https://github.com/Leonitex/hack-the-world.git
+git clone https://github.com/Leonitex/hack-the-world.git
 cd hack-the-world
 python3 -m venv .venv
 source .venv/bin/activate
@@ -35,6 +35,11 @@ The hackathon Baseten key requires this exact model slug:
 ```text
 meta-models/muse-spark-open-1026
 ```
+
+To use the Meta Model API directly instead, set `MODEL_API_KEY` and
+`HTW_PROVIDER=meta`. The default `HTW_PROVIDER=auto` prefers the proven
+Baseten route when `BASETEN_API_KEY` is present. `PORT` and `HTW_HOST`
+override the listen address (default `127.0.0.1:8000`).
 
 ## Test
 
