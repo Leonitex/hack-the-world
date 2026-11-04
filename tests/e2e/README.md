@@ -45,6 +45,9 @@ server runs on another host or port.
 
 - Workers are serial (`workers: 1`): the demo server holds one global
   session, so parallel tests would corrupt each other's state.
+- A shared `beforeEach` resets through the UI ("Start a new
+  investigation") before each test; never assume a fresh session, since
+  each test leaves the global session behind.
 - Never run these specs against a server with live keys: the assertions
   expect the exact fixture script from `agent/factory.py:e2e_script`.
 - Voice, microphone, camera, and physical-device behavior are manual

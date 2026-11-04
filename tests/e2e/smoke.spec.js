@@ -3,8 +3,23 @@
 // fixture (HTW_E2E_FAKE_PROVIDER=1); no live keys, no network models.
 const { test, expect } = require('@playwright/test');
 
-test('technician completes two distinct diagnostic turns', async ({ page }) => {
+test.beforeEach(async ({ page }) => {
+  // The demo server holds one global session: every test loads home, waits
+  // for exactly one of the two mutually exclusive views, and resets through
+  // the real UI when a previous session is present. Each test is therefore
+  // independent of file order, grep selection, or repetition.
   await page.goto('/');
+  await page
+    .locator('#problemInput, button:has-text("Start a new investigation")')
+    .first()
+    .waitFor();
+  const reset = page.getByRole('button', { name: 'Start a new investigation' });
+  if ((await reset.count()) > 0) {
+    await reset.click();
+  }
+});
+
+test('technician completes two distinct diagnostic turns', async ({ page }) => {
   await expect(page.locator('svg.orb-svg')).toBeVisible();
   await page.locator('#problemInput').fill('E2E laptop has no display');
   await page.getByRole('button', { name: 'Begin investigation' }).click();
@@ -27,7 +42,6 @@ test('technician completes two distinct diagnostic turns', async ({ page }) => {
 });
 
 test('history survives a page reload', async ({ page }) => {
-  await page.goto('/');
   await page.locator('#problemInput').fill('E2E laptop has no display');
   await page.getByRole('button', { name: 'Begin investigation' }).click();
   await expect(page.locator('.card.next .big-action')).toContainText('E2E check one');

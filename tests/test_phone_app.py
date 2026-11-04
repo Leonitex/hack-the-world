@@ -533,5 +533,17 @@ class PhoneAppTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", body)
 
 
+    def test_start_after_reset_shows_fresh_form(self):
+        # E2E precondition: the reset button returns the app to the start
+        # form, and a new session starts cleanly afterward.
+        self.start_session(script=[propose_cause(), request_evidence()])
+        self.client.post("/reset", follow_redirects=True)
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn('id="problemInput"', body)
+        self.assertNotIn('id="answerInput"', body)
+        response, _ = self.start_session(script=[propose_cause(), request_evidence()])
+        self.assertIn("Do this next", response.get_data(as_text=True))
+
+
 if __name__ == "__main__":
     unittest.main()

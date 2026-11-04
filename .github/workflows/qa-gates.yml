@@ -59,10 +59,10 @@ jobs:
           HTW_E2E_FAKE_PROVIDER=1 python phone_app.py &
           SERVER_PID=$!
           for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:8000/ && break
+            curl -sf -o /dev/null http://127.0.0.1:8000/ && break
             sleep 2
           done
-          curl -sf http://127.0.0.1:8000/ || exit 1
+          curl -sf -o /dev/null http://127.0.0.1:8000/ || exit 1
           cd tests/e2e && npx playwright test
           STATUS=$?
           kill $SERVER_PID
