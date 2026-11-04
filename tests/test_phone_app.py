@@ -178,6 +178,22 @@ class PhoneAppTests(unittest.TestCase):
         self.assertEqual(len(snapshot.hypotheses), 2)
         self.assertEqual(snapshot.turn_count, 4)
 
+    def test_orb_error_and_accessibility_hooks_present(self):
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("body.error .orb-core", body)
+        self.assertIn('aria-live="polite"', body)
+        self.assertIn('aria-label="Voice input"', body)
+        self.assertIn("prefers-reduced-motion", body)
+        self.assertIn('querySelector(".card.error")', body)
+        self.assertIn("permissions", body)
+
+    def test_evidence_provenance_visible_on_demand(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("Source: user_text", body)
+        self.assertIn("channel: phone_ui", body)
+        self.assertIn("kind: initial_problem", body)
+
     def test_double_resume_rejected_friendly(self):
         _, fake = self.start_session(script=[propose_cause(), request_evidence()])
         fake.stage(propose_cause("Cause B"))

@@ -44,6 +44,19 @@ Meta as fallback, rather than Meta-first with Baseten as backup. Reason:
 demo reliability; the issue itself says not to block launch on direct
 Meta API compatibility. Explicit `HTW_PROVIDER=meta` is fully supported.
 
-## M4 — Hands-free technician UI and orb: PENDING
+## M4 — Hands-free technician UI and orb: DONE (code + tests; device/browser acceptance manual)
+
+Built on `565fd3a` (orb, read-aloud, dictation, verification display).
+Added: red error orb state with 4s auto-recovery (recognition/speech
+failures, server-error pages), microphone permission indicator via
+`navigator.permissions`, `aria-live` assistant bubble + `role=status`
+voice note + mic `aria-label`, desktop breakpoint (860px) + mobile
+styles + `prefers-reduced-motion`, per-evidence source/provenance in
+expandable chips. Hypothesis badges show only genuine core statuses —
+no fake high/medium/low rankings anywhere.
+
+Tests: 136 total green (`test_phone_app` 15, +2 M4 UI pins). Manual
+acceptance still required: full device conversation, PC-browser cycle
+with image upload, model-chosen next test spoken end to end.
 
 ## M5 — Test, polish, and demo handoff: PENDING
