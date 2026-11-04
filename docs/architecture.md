@@ -88,15 +88,21 @@ The model may propose changes, but application code validates references and own
 
 ### 5. Diagnostic tools
 
-The first provider-independent tool surface should be small and generic. Candidate tools include:
-- `record_evidence`;
-- `propose_hypotheses` / `update_hypothesis`;
+The first provider-independent tool surface should be small and generic.
+
+Model-selectable tools are exactly the actions in `MODEL_ACTION_FIELDS` (`diagnostic_core/contracts.py`):
+- `propose_hypothesis`;
+- `update_hypothesis`;
 - `request_diagnostic_test`;
-- `record_test_result`;
 - `request_user_evidence`;
 - `submit_recommendation`.
 
-Tool definitions should not hard-code the primary demo scenario. The model chooses which valid tool to call next.
+Application/trusted-caller only ingestion actions. These MUST NOT be presented to the model as callable tools:
+- `record_evidence`;
+- `record_test_result`;
+- `provide_user_evidence`.
+
+Tool definitions should not hard-code the primary demo scenario. The model chooses which valid model-selectable tool to call next.
 
 ### 6. Verification layer
 
@@ -168,9 +174,11 @@ SAM is a supporting tool, not the core product and not something to invoke on ev
 Suggested session statuses:
 - `investigating`
 - `needs_input`
-- `awaiting_verification`
+- `awaiting_verification` (internal/transient only; see below)
 - `completed`
 - `paused`
+
+`awaiting_verification` is an internal/transient state during the synchronous `submit_recommendation` verification transition, not a stable externally observable session state that a UI should depend on.
 
 ## Reliability rules
 
