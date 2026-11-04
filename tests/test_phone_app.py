@@ -448,5 +448,25 @@ class PhoneAppTests(unittest.TestCase):
         self.assertIn("Investigation not found.", response.get_data(as_text=True))
 
 
+    def test_cinematic_orb_layers_present(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("orb-spin-d", body)
+        self.assertIn("orb-inner", body)
+        self.assertIn("orb-scanline", body)
+        self.assertIn("completeBurst", body)
+        self.assertIn("body.completed .orb-core", body)
+        self.assertIn("bg-glow-a", body)
+        self.assertIn("bg-glow-b", body)
+        self.assertIn("onboundary", body)
+        self.assertIn("word-pop", body)
+        self.assertIn('querySelector(".card.final")', body)
+
+    def test_motion_respects_reduced_motion(self):
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("prefers-reduced-motion", body)
+        self.assertIn(".orb-scanline { opacity:0 !important; }", body)
+
+
 if __name__ == "__main__":
     unittest.main()
