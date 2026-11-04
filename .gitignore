@@ -30,3 +30,5 @@ Thumbs.db
 uploads/
 # Python tempfile fallback lands here under some sandboxes; never commit it
 tmp*/
+playwright-report/
+test-results/

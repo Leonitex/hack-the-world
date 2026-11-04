@@ -1,0 +1,69 @@
+name: qa-gates
+
+on:
+  push:
+    branches:
+      - work/qa-release-gates
+      - work/nonrepeating-diagnosis
+      - work/persistent-history-cinematic-ui
+  pull_request:
+    branches:
+      - main
+      - work/final-hackathon-sprint
+      - work/final-polish-followup
+      - work/persistent-history-cinematic-ui
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Unit suite
+        run: python -m unittest discover -s tests
+      - name: Compile checks
+        run: python -m compileall -q agent diagnostic_core examples tests history_store.py phone_app.py
+      - name: E2E spec syntax
+        run: |
+          node --check tests/e2e/playwright.config.js
+          node --check tests/e2e/smoke.spec.js
+
+  e2e:
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Install E2E dependencies
+        working-directory: tests/e2e
+        run: npm ci
+      - name: Install Chromium
+        working-directory: tests/e2e
+        run: npx playwright install --with-deps chromium
+      - name: Run browser E2E against fixture server
+        run: |
+          HTW_E2E_FAKE_PROVIDER=1 python phone_app.py &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:8000/ && break
+            sleep 2
+          done
+          curl -sf -o /dev/null http://127.0.0.1:8000/ || exit 1
+          cd tests/e2e && npx playwright test
+          STATUS=$?
+          kill $SERVER_PID
+          exit $STATUS

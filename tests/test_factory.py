@@ -8,8 +8,9 @@ from unittest.mock import patch
 
 from agent.baseten import BasetenMuseProvider
 from agent.factory import create_provider
+from agent.loop import AgentLoop, LoopOutcome
 from agent.meta_provider import MetaProvider
-from agent.providers import ProviderError, ProviderRequest
+from agent.providers import FakeProvider, ProviderError, ProviderRequest
 from diagnostic_core.engine import DiagnosticSession
 
 
@@ -104,6 +105,37 @@ class FactoryTests(unittest.TestCase):
         content = seen[0]["messages"][1]["content"]
         images = [block for block in content if block.get("type") == "image_url"]
         self.assertEqual([image["image_url"]["url"] for image in images], ["data:image/png;base64,AAA"])
+
+
+    def test_e2e_fixture_selected_without_keys(self):
+        with patch.dict(os.environ, {"HTW_E2E_FAKE_PROVIDER": "1"}, clear=True):
+            provider, label = create_provider()
+        self.assertIsInstance(provider, FakeProvider)
+        self.assertIn("E2E fixture", label)
+
+    def test_e2e_fixture_requires_exact_opt_in(self):
+        for value in ("0", "yes", "true", ""):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"HTW_E2E_FAKE_PROVIDER": value}, clear=True):
+                    with self.assertRaisesRegex(ProviderError, "No provider key"):
+                        create_provider()
+
+    def test_e2e_fixture_drives_two_distinct_turns(self):
+        with patch.dict(os.environ, {"HTW_E2E_FAKE_PROVIDER": "1"}, clear=True):
+            provider, _ = create_provider()
+        core = DiagnosticSession("E2E problem")
+        core.execute("record_evidence", {"source": "user_text", "statement": "E2E problem",
+                                         "provenance": {"reporter": "e2e"}})
+        loop = AgentLoop(core, provider, max_provider_steps=14, max_advance_steps=14)
+        first = loop.run()
+        self.assertEqual(first.outcome, LoopOutcome.NEEDS_INPUT)
+        first_action = first.session.next_action.action
+        self.assertIn("E2E check one", first_action)
+        loop.resume_with_result("E2E result one", {"reporter": "e2e"})
+        second = loop.run()
+        self.assertEqual(second.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertIn("E2E check two", second.session.next_action.action)
+        self.assertNotEqual(second.session.next_action.action, first_action)
 
 
 if __name__ == "__main__":
