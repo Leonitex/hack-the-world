@@ -162,7 +162,15 @@ body.completed .orb-spin-a circle { stroke:var(--good); }
 .bg-glow-a { width:520px; height:520px; left:-160px; top:-120px; background:radial-gradient(circle, rgba(83,116,255,.12), transparent 65%); animation:glowDrift 26s ease-in-out infinite alternate; }
 .bg-glow-b { width:620px; height:620px; right:-220px; top:30%; background:radial-gradient(circle, rgba(69,208,255,.09), transparent 65%); animation:glowDrift 34s ease-in-out infinite alternate-reverse; }
 @keyframes glowDrift { from { transform:translate(0,0); } to { transform:translate(60px,40px); } }
-@media (prefers-reduced-motion:reduce) { .orb-svg *, .orb-sweep, .card, .bg-glow-a, .bg-glow-b, .orb-scanline { animation:none !important; } .orb-core, .orb-svg { transition:none; } .orb-scanline { opacity:0 !important; } }
+.bubble { animation:bubblePop .45s cubic-bezier(.2,.9,.3,1.15) both; }
+@keyframes bubblePop { from { opacity:0; transform:scale(.96) translateY(6px); } }
+.recents { display:grid; gap:8px; max-width:640px; margin:0 auto 14px; }
+.recent-bubble { display:block; text-align:left; opacity:.72; border:1px solid #22364d; border-radius:14px; padding:9px 12px; color:var(--text); text-decoration:none; background:rgba(13,20,30,.7); animation:rise .4s ease both; font-size:13px; }
+.recent-bubble strong { display:block; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.6px; margin-bottom:2px; }
+.recent-bubble span { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.recent-user { border-color:#2f5a4c; }
+.recent-user strong { color:var(--good); }
+@media (prefers-reduced-motion:reduce) { .orb-svg *, .orb-sweep, .card, .bubble, .recent-bubble, .bg-glow-a, .bg-glow-b, .orb-scanline { animation:none !important; } .orb-core, .orb-svg { transition:none; } .orb-scanline { opacity:0 !important; } }
 </style>
 </head>
 <body class="idle">
@@ -171,6 +179,7 @@ body.completed .orb-spin-a circle { stroke:var(--good); }
 <div class="orb-wrap" role="img" aria-label="Assistant status"><div class="orb-sweep"></div><div class="orb-scanline"></div><svg class="orb-svg" viewBox="0 0 240 240" aria-hidden="true"><defs><radialGradient id="orbCore" cx="38%" cy="32%" r="75%"><stop offset="0%" stop-color="#e8fbff"/><stop offset="18%" stop-color="#7fdcff"/><stop offset="45%" stop-color="#4f79e8"/><stop offset="72%" stop-color="#232a55"/><stop offset="100%" stop-color="#0c1226"/></radialGradient><radialGradient id="orbCoreError" cx="38%" cy="32%" r="75%"><stop offset="0%" stop-color="#ffe8ec"/><stop offset="25%" stop-color="#ff8b98"/><stop offset="55%" stop-color="#a83a4a"/><stop offset="100%" stop-color="#2a0e14"/></radialGradient><radialGradient id="orbHalo" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#66d9ff" stop-opacity=".28"/><stop offset="55%" stop-color="#8b7cff" stop-opacity=".1"/><stop offset="100%" stop-color="#8b7cff" stop-opacity="0"/></radialGradient><linearGradient id="orbArc" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#66d9ff"/><stop offset="100%" stop-color="#8b7cff"/></linearGradient></defs><circle cx="120" cy="120" r="112" fill="url(#orbHalo)" class="orb-breathe"/><g class="orb-spin-a"><circle cx="120" cy="120" r="86" fill="none" stroke="url(#orbArc)" stroke-width="2.5" stroke-dasharray="52 26 12 26" stroke-linecap="round" opacity=".9"/></g><g class="orb-spin-b"><circle cx="120" cy="120" r="70" fill="none" stroke="#66d9ff" stroke-width="1.5" stroke-dasharray="4 10" opacity=".55"/></g><g class="orb-spin-d"><circle cx="120" cy="120" r="98" fill="none" stroke="#8b7cff" stroke-width="1" stroke-dasharray="26 18 6 18" opacity=".4"/></g><g class="orb-spin-c"><circle cx="120" cy="34" r="7" fill="#8fe9ff" opacity=".25"/><circle cx="120" cy="34" r="3.5" fill="#8fe9ff"/><circle cx="120" cy="206" r="6" fill="#8fe9ff" opacity=".2"/><circle cx="120" cy="206" r="3" fill="#8fe9ff"/></g><circle cx="120" cy="120" r="46" fill="url(#orbCore)" class="orb-core"/><circle cx="120" cy="120" r="29" fill="url(#orbCore)" class="orb-inner"/><ellipse cx="104" cy="102" rx="20" ry="12" fill="#ffffff" opacity=".28" transform="rotate(-24 104 102)"/><g fill="#9fdcff"><circle cx="52" cy="88" r="1.6" class="orb-p1"/><circle cx="188" cy="96" r="1.3" class="orb-p2"/><circle cx="60" cy="160" r="1.4" class="orb-p3"/><circle cx="182" cy="162" r="1.7" class="orb-p4"/></g></svg><div class="orb-label" id="orbLabel">Ready</div></div>
 <div class="orb-sub" id="orbSub">{% if error %}Needs attention{% elif session.next_action %}Next test ready{% elif session.recommendation %}Verified recommendation ready{% elif session %}Reviewing evidence{% else %}Ready{% endif %}</div>
 <div class="bubble" id="assistantBubble" aria-live="polite"><div class="state" id="assistantState">{% if error %}Attention{% elif session and session.recommendation %}Verified{% elif session and session.next_action %}Next diagnostic step{% elif session %}Investigating{% else %}Ready{% endif %}</div><div class="message" id="assistantMessage">{% if error %}{{ error }}{% elif session and session.recommendation %}{{ session.recommendation.action }}{% elif session and session.next_action %}{{ session.next_action.action }}{% elif session %}I am reviewing the evidence and testing competing causes.{% else %}Tell me what the device is doing. You can speak, type, or add a photo.{% endif %}</div></div>
+{% if recents %}<div class="recents">{% for pos, entry in recents %}<a class="recent-bubble{% if entry.kind == 'user' %} recent-user{% endif %}" href="#t-{{ pos }}"><strong>{{ entry.title }}</strong><span>{{ entry.detail }}</span></a>{% endfor %}</div>{% endif %}
 <div class="controls"><button type="button" class="secondary" id="speakButton" onclick="speakCurrent()">Hear instruction</button><button type="button" class="secondary" id="stopButton" onclick="stopSpeech()">Stop</button><button type="button" class="secondary" id="handsFreeButton" onclick="toggleHandsFree()">Hands-free: off</button></div>
 <div class="voice-note" id="voiceSupport" role="status"></div>
 </div></div>{% endmacro %}
@@ -196,7 +205,7 @@ body.completed .orb-spin-a circle { stroke:var(--good); }
 {% if session.recommendation %}<div class="card final"><h2>Verified recommendation</h2><p class="big-action">{{ session.recommendation.action }}</p><small>Grounded in {{ session.recommendation.evidence_ids|length }} recorded evidence item(s).</small></div>{% endif %}
 <form method="post" action="{{ url_for('reset') }}"><button type="submit" class="secondary" style="width:100%">Start a new investigation</button></form>
 </section>
-<section class="zone-timeline" aria-label="Investigation history">{% if sessions %}<div class="card sticky">{{ session_list("Investigations") }}</div>{% endif %}{% if timeline %}<div class="card"><h2>Timeline</h2><ol class="timeline">{% for entry in timeline %}<li class="t-event"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>{{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div></div></li>{% endfor %}</ol></div>{% endif %}</section>
+<section class="zone-timeline" aria-label="Investigation history">{% if sessions %}<div class="card sticky">{{ session_list("Investigations") }}</div>{% endif %}{% if timeline %}<div class="card"><h2>Timeline</h2><ol class="timeline">{% for entry in timeline %}<li class="t-event" id="t-{{ loop.index }}"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>{{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div></div></li>{% endfor %}</ol></div>{% endif %}</section>
 <section class="zone-tech" aria-label="Technical details"><div class="card sticky"><details><summary>Evidence & technical details</summary><h3>Evidence</h3>{% if session.evidence %}<div class="evidence-grid">{% for e in session.evidence %}<details class="evidence-chip"><summary><strong>{{ e.id.split(':')[-1] }}</strong> · {{ e.statement }}</summary><div class="muted">Source: {{ e.source }}</div>{% for pair in e.provenance %}<div class="muted">{{ pair[0] }}: {{ pair[1] }}</div>{% endfor %}</details>{% endfor %}</div>{% else %}<div class="muted">No evidence recorded yet.</div>{% endif %}<h3>Competing hypotheses</h3>{% if session.hypotheses %}{% for h in session.hypotheses %}<div class="hypothesis"><strong>{{ h.cause }}</strong><div class="badges"><span class="badge">{{ h.status }}</span></div>{% if h.rationale %}<small>{{ h.rationale }}</small>{% endif %}</div>{% endfor %}{% else %}<div class="muted">No cause proposed yet.</div>{% endif %}</details></div></section>
 </div>
 {% endif %}
@@ -327,9 +336,16 @@ def _record_photo_event(record_id):
     del STATE["timeline"][:-TIMELINE_LIMIT]
 
 
+def _recent_entries():
+    """Last two live timeline entries with 1-based positions for anchor links."""
+    tail = STATE["timeline"][-2:]
+    start = len(STATE["timeline"]) - len(tail) + 1
+    return [(start + index, entry) for index, entry in enumerate(tail)]
+
+
 def current_context():
     loop = STATE["loop"]
-    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"], "provider_label": STATE["provider_label"], "advance_note": STATE["advance_note"], "timeline": STATE["timeline"], "draft_problem": STATE["draft_problem"], "draft_answer": STATE["draft_answer"], "sessions": get_store().list_sessions(), "viewing": None}
+    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"], "provider_label": STATE["provider_label"], "advance_note": STATE["advance_note"], "timeline": STATE["timeline"], "draft_problem": STATE["draft_problem"], "draft_answer": STATE["draft_answer"], "sessions": get_store().list_sessions(), "viewing": None, "recents": _recent_entries()}
 
 
 @app.get("/")

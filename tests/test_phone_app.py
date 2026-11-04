@@ -468,5 +468,30 @@ class PhoneAppTests(unittest.TestCase):
         self.assertIn(".orb-scanline { opacity:0 !important; }", body)
 
 
+    def test_recent_bubbles_link_to_timeline(self):
+        self.start_session(script=[propose_cause(), request_evidence()])
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn('class="recents"', body)
+        self.assertIn("New cause considered", body)
+        self.assertIn('href="#t-2"', body)
+        self.assertIn('id="t-2"', body)
+        self.assertIn('href="#t-3"', body)
+        self.assertIn('id="t-3"', body)
+        self.assertIn("bubblePop", body)
+
+    def test_user_recents_styled_distinctly(self):
+        _, fake = self.start_session(script=[propose_cause(), request_evidence()])
+        fake.stage("garbage")
+        self.client.post("/resume", data={"answer": "The light is steady green."},
+                         follow_redirects=True)
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("recent-user", body)
+        self.assertIn("You reported", body)
+
+    def test_no_recents_before_session(self):
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertNotIn('class="recents"', body)
+
+
 if __name__ == "__main__":
     unittest.main()
