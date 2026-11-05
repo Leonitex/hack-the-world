@@ -23,6 +23,7 @@ from agent.tools import MODEL_TOOLS
 from diagnostic_core.contracts import MODEL_ACTION_FIELDS
 from diagnostic_core.engine import DiagnosticSession
 from diagnostic_core.models import Rejected, SessionStatus as S
+from history_store import HistoryStore
 
 
 PROBLEM = "Phone shows no response when the power button is pressed."
@@ -674,6 +675,93 @@ class ProviderRenderingTests(unittest.TestCase):
         lowered = BASETEN_SYSTEM_PROMPT.lower()
         self.assertIn("never request the same test twice", lowered)
         self.assertIn("negative", lowered)
+
+
+class StoreTests(unittest.TestCase):
+    """M8E: checkpoints, case lifecycle, legacy migration."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = os.path.join(self._tmp.name, "history.db")
+
+    def test_checkpoint_round_trip(self):
+        store = HistoryStore(self.path)
+        store.create_session("s1", "Case 1", PROBLEM)
+        bundle = {"version": 1, "session": {"id": "s1"}, "loop": {"steps_used": 3}}
+        store.save_checkpoint("s1", bundle)
+        self.assertEqual(store.load_checkpoint("s1"), bundle)
+        self.assertIsNone(store.load_checkpoint("missing"))
+
+    def test_checkpoint_survives_store_restart(self):
+        store = HistoryStore(self.path)
+        store.create_session("s1", "Case 1", PROBLEM)
+        store.save_checkpoint("s1", {"version": 1})
+        reopened = HistoryStore(self.path)
+        self.assertEqual(reopened.load_checkpoint("s1"), {"version": 1})
+        self.assertEqual(reopened.get_session("s1")["archived"], 0)
+
+    def test_legacy_database_migrates_without_data_loss(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL,"
+            " problem TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'live',"
+            " run_token TEXT NOT NULL, created_at TEXT NOT NULL,"
+            " updated_at TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
+        conn.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " session_id TEXT NOT NULL REFERENCES sessions(id),"
+            " seq INTEGER NOT NULL, kind TEXT NOT NULL, glyph TEXT NOT NULL,"
+            " title TEXT NOT NULL, detail TEXT NOT NULL, record_id TEXT,"
+            " created_at TEXT NOT NULL, UNIQUE (session_id, seq))")
+        conn.execute(
+            "INSERT INTO sessions (id, name, problem, status, run_token,"
+            " created_at, updated_at, archived) VALUES"
+            " ('old', 'Old case', 'Old problem', 'live', 'dead-token',"
+            " '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 0)")
+        conn.execute(
+            "INSERT INTO events (session_id, seq, kind, glyph, title, detail,"
+            " record_id, created_at) VALUES ('old', 1, 'note', '*',"
+            " 'Old event', 'Kept.', NULL, '2026-01-01T00:00:00+00:00')")
+        conn.commit()
+        conn.close()
+        store = HistoryStore(self.path)
+        session = store.get_session("old")
+        self.assertEqual(session["case_status"], "open")
+        self.assertEqual(session["name"], "Old case")
+        events = store.get_events("old")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["title"], "Old event")
+        # No checkpoint exists, so the stale live row is safely archived.
+        self.assertEqual(session["archived"], 1)
+        store.save_checkpoint("old", {"version": 1})
+        self.assertEqual(store.load_checkpoint("old"), {"version": 1})
+
+    def test_case_status_lifecycle(self):
+        store = HistoryStore(self.path)
+        store.create_session("s1", "Case 1", PROBLEM)
+        self.assertEqual(store.get_session("s1")["case_status"], "open")
+        store.set_case_status("s1", "awaiting")
+        self.assertEqual(store.get_session("s1")["case_status"], "awaiting")
+        store.set_case_status("s1", "inconclusive")
+        store.set_case_status("s1", "solved", note="Replaced the battery.")
+        solved = store.get_session("s1")
+        self.assertEqual(solved["case_status"], "solved")
+        self.assertEqual(solved["solved_note"], "Replaced the battery.")
+        store.set_case_status("s1", "open")
+        reopened = store.get_session("s1")
+        self.assertEqual(reopened["case_status"], "open")
+        self.assertEqual(reopened["solved_note"], "")
+        with self.assertRaises(ValueError):
+            store.set_case_status("s1", "teleporting")
+
+    def test_adopt_session_updates_owner(self):
+        first = HistoryStore(self.path)
+        first.create_session("s1", "Case 1", PROBLEM)
+        first.save_checkpoint("s1", {"version": 1})
+        second = HistoryStore(self.path)
+        second.adopt_session("s1")
+        self.assertEqual(second.get_session("s1")["run_token"], second.run_token)
 
 
 if __name__ == "__main__":
