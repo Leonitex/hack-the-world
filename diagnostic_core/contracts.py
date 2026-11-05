@@ -21,6 +21,10 @@ MODEL_ACTION_FIELDS = {
         "hypothesis_id": "text", "action": "text", "evidence_ids": "refs",
         "acknowledged_contradictions": "refs",
     },
+    "declare_inconclusive": {
+        "summary": "text", "checked_evidence_ids": "refs",
+        "remaining_possibilities": "text", "safe_next_steps": "text",
+    },
 }
 
 TRUSTED_INGESTION_ACTION_FIELDS = {
@@ -31,6 +35,7 @@ TRUSTED_INGESTION_ACTION_FIELDS = {
     "provide_user_evidence": {
         "request_id": "text", "source": "text", "statement": "text", "provenance": "metadata",
     },
+    "reopen_investigation": {"reason": "text"},
 }
 
 if MODEL_ACTION_FIELDS.keys() & TRUSTED_INGESTION_ACTION_FIELDS.keys():

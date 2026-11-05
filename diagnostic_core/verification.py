@@ -58,3 +58,10 @@ def verify_recommendation(session, candidate):
     if set(candidate.acknowledged_contradictions) != unresolved:
         raise Rejected("Recommendation must surface all unresolved contradictions")
     return ()
+
+
+def verify_inconclusive(session, report):
+    """An inconclusive handoff must cite real checked evidence, never invent it."""
+    if not report.checked_evidence_ids:
+        raise Rejected("An inconclusive report must cite checked evidence")
+    verify_references(session, report.checked_evidence_ids)
