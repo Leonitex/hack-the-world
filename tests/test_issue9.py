@@ -9,12 +9,17 @@ network, no credentials.
 
 import json
 import os
+import socket
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
+from agent.baseten import SYSTEM_PROMPT as BASETEN_SYSTEM_PROMPT, BasetenMuseProvider
 from agent.loop import AgentLoop, LoopOutcome
-from agent.providers import CompletedStep, FakeProvider, ToolCall
+from agent.meta_provider import DEVELOPER_INSTRUCTION, render_state
+from agent.providers import CompletedStep, FakeProvider, ProviderRequest, ToolCall
+from agent.tools import MODEL_TOOLS
 from diagnostic_core.contracts import MODEL_ACTION_FIELDS
 from diagnostic_core.engine import DiagnosticSession
 from diagnostic_core.models import Rejected, SessionStatus as S
@@ -583,6 +588,92 @@ class BookkeepingTests(unittest.TestCase):
         saved["version"] = 999
         with self.assertRaises(Rejected):
             loop.apply_bookkeeping(saved)
+
+
+class _CannedBasetenResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return json.dumps(self._payload).encode("utf-8")
+
+
+def _request_with_trajectory():
+    """A real linked request/result pair plus the provider request for it."""
+    loop, provider = _loop(script=[
+        _request_call(POWER_TEST),
+        ToolCall("propose_hypothesis", {"cause": "Dead battery."}),
+    ])
+    loop.run()
+    loop.resume_with_result("Nothing happened. No LED, no fan.",
+                            {"channel": "test", "kind": "observation"})
+    loop.run()
+    return provider.requests[-1]
+
+
+class ProviderRenderingTests(unittest.TestCase):
+    """M8A/M8B: both providers see completed tests tied to results."""
+
+    def setUp(self):
+        for target in ("socket.create_connection", "socket.socket.connect",
+                       "socket.socket.connect_ex"):
+            guard = patch(target, side_effect=AssertionError("Network forbidden"))
+            guard.start()
+            self.addCleanup(guard.stop)
+
+    def test_meta_renders_completed_test_with_linked_result(self):
+        request = _request_with_trajectory()
+        text = render_state(request)
+        step = request.trajectory[0]
+        self.assertIn(POWER_TEST, text)
+        self.assertIn("No LED", text)
+        self.assertIn(step.request_id, text)
+        self.assertIn(step.evidence_id, text)
+        self.assertIn(f"via {step.request_id}", text)
+
+    def test_meta_renders_empty_trajectory_explicitly(self):
+        session = DiagnosticSession(PROBLEM).snapshot
+        request = ProviderRequest(
+            problem=PROBLEM, session=session, tools=MODEL_TOOLS, feedback=(),
+            turn_count=0, completion_attempts=0, remaining_provider_steps=10,
+            trajectory=(),
+        )
+        self.assertIn("none completed yet", render_state(request))
+
+    def test_meta_instruction_forbids_repeats_and_allows_honest_close(self):
+        lowered = DEVELOPER_INSTRUCTION.lower()
+        self.assertIn("never request the same or an equivalent test again", lowered)
+        self.assertIn("negative observation", lowered)
+        self.assertIn("inconclusive", lowered)
+
+    def test_baseten_instruction_carries_completed_history(self):
+        request = _request_with_trajectory()
+        response = {"choices": [{"message": {"tool_calls": [{
+            "id": "call_1", "type": "function", "function": {
+                "name": "propose_hypothesis",
+                "arguments": json.dumps({"cause": "Cause A"}),
+            }}]}}]}
+        with patch("urllib.request.urlopen",
+                   return_value=_CannedBasetenResponse(response)) as mocked:
+            BasetenMuseProvider(api_key="test-key").decide(request)
+        sent = json.loads(mocked.call_args.args[0].data.decode("utf-8"))
+        user_text = sent["messages"][1]["content"][0]["text"]
+        step = request.trajectory[0]
+        self.assertIn(POWER_TEST, user_text)
+        self.assertIn("No LED", user_text)
+        self.assertIn(step.request_id, user_text)
+        self.assertIn(step.evidence_id, user_text)
+
+    def test_baseten_system_prompt_forbids_repeats(self):
+        lowered = BASETEN_SYSTEM_PROMPT.lower()
+        self.assertIn("never request the same test twice", lowered)
+        self.assertIn("negative", lowered)
 
 
 if __name__ == "__main__":
