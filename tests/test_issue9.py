@@ -25,6 +25,8 @@ from diagnostic_core.engine import DiagnosticSession
 from diagnostic_core.models import Rejected, SessionStatus as S
 from history_store import HistoryStore
 
+import phone_app
+
 
 PROBLEM = "Phone shows no response when the power button is pressed."
 
@@ -273,6 +275,12 @@ class CheckpointTests(unittest.TestCase):
         payload["status"] = "teleporting"
         with self.assertRaises(Rejected):
             DiagnosticSession.from_checkpoint(payload)
+
+    def test_round_trip_with_blank_rationale_hypothesis(self):
+        session, _evidence_id = _session_with_evidence()
+        session.execute("propose_hypothesis", {"cause": "Fresh cause."})
+        restored = DiagnosticSession.from_checkpoint(session.to_checkpoint())
+        self.assertEqual(restored.snapshot, session.snapshot)
 
     def test_needs_input_checkpoint_resumes_with_matching_result(self):
         session, _e, _h, _r = self._rich_session()
@@ -762,6 +770,256 @@ class StoreTests(unittest.TestCase):
         second = HistoryStore(self.path)
         second.adopt_session("s1")
         self.assertEqual(second.get_session("s1")["run_token"], second.run_token)
+
+
+class _StagedFake(FakeProvider):
+    def stage(self, *entries):
+        self._script.extend(entries)
+
+
+def _cause(name="Cause A"):
+    return ToolCall("propose_hypothesis", {"cause": name})
+
+
+def _ask(action, observations=("What happened?",)):
+    return ToolCall("request_user_evidence", {
+        "action": action, "observations": list(observations)})
+
+
+class AppCaseTests(unittest.TestCase):
+    """M8E: reopenable cases, restart recovery, solve/reopen lifecycle."""
+
+    def setUp(self):
+        for target in ("socket.create_connection", "socket.socket.connect",
+                       "socket.socket.connect_ex"):
+            guard = patch(target, side_effect=AssertionError("Network forbidden"))
+            guard.start()
+            self.addCleanup(guard.stop)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_store = phone_app._STORE
+        self.db_path = os.path.join(self._tmp.name, "history.db")
+        phone_app._STORE = HistoryStore(self.db_path)
+        phone_app.STATE["cases"] = {}
+        self.client = phone_app.app.test_client()
+        self.client.post("/reset")
+
+    def tearDown(self):
+        self.client.post("/reset")
+        phone_app._STORE = self._old_store
+
+    def start_case(self, problem="The phone shows no response.", script=()):
+        fake = _StagedFake(list(script))
+        with patch("phone_app.create_provider", return_value=(fake, "Test Provider")):
+            response = self.client.post(
+                "/start", data={"problem": problem}, follow_redirects=True)
+        return response, fake
+
+    def resume(self, answer, case_id=None):
+        data = {
+            "case_id": case_id or phone_app.STATE["history_session_id"],
+            "answer": answer,
+        }
+        return self.client.post("/resume", data=data, follow_redirects=True)
+
+    def retry(self, case_id=None):
+        data = {"case_id": case_id or phone_app.STATE["history_session_id"]}
+        return self.client.post("/retry", data=data, follow_redirects=True)
+
+    def simulate_restart(self):
+        """Drop all in-memory cases and reopen the same database file."""
+        phone_app._STORE = HistoryStore(self.db_path)
+        phone_app.STATE["cases"] = {}
+        for key in ("loop", "last_result", "error", "provider",
+                    "provider_label", "advance_note", "history_session_id",
+                    "active_id"):
+            phone_app.STATE[key] = None
+        phone_app.STATE["images"] = {}
+        phone_app.STATE["timeline"] = []
+        phone_app.STATE["draft_problem"] = ""
+        phone_app.STATE["draft_answer"] = ""
+
+    def test_cases_stay_open_and_switchable(self):
+        first, _ = self.start_case(
+            script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        self.assertIn("Do this next", first.get_data(as_text=True))
+        hid_a = phone_app.STATE["history_session_id"]
+        self.start_case(problem="Second device is silent.",
+                        script=[_cause("Cause B"), _ask("Listen for fan noise.")])
+        hid_b = phone_app.STATE["history_session_id"]
+        self.assertNotEqual(hid_a, hid_b)
+        store = phone_app.get_store()
+        self.assertEqual(store.get_session(hid_a)["archived"], 0)
+        self.assertEqual(store.get_session(hid_b)["archived"], 0)
+        switched = self.client.post(f"/case/{hid_a}/switch", follow_redirects=True)
+        self.assertIn("Check the indicator light", switched.get_data(as_text=True))
+        snapshot = phone_app.STATE["loop"].session.snapshot
+        self.assertEqual(snapshot.id, hid_a)
+        self.assertEqual(len(snapshot.evidence), 1)
+        self.assertEqual(len(snapshot.hypotheses), 1)
+
+    def test_stale_case_post_rejected_without_mutation(self):
+        response_a, _ = self.start_case(
+            script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        hid_a = phone_app.STATE["history_session_id"]
+        self.assertIn("Do this next", response_a.get_data(as_text=True))
+        self.start_case(problem="Second device is silent.",
+                        script=[_cause("Cause B"), _ask("Listen for fan noise.")])
+        hid_b = phone_app.STATE["history_session_id"]
+        turns_b = phone_app.STATE["loop"].session.snapshot.turn_count
+        response = self.resume("Stale answer for the wrong case.", case_id=hid_a)
+        self.assertIn("different case", response.get_data(as_text=True))
+        self.assertEqual(phone_app.STATE["history_session_id"], hid_b)
+        self.assertEqual(
+            phone_app.STATE["loop"].session.snapshot.turn_count, turns_b)
+        response = self.client.post(
+            "/resume", data={"answer": "Missing case id."}, follow_redirects=True)
+        self.assertIn("different case", response.get_data(as_text=True))
+        self.assertEqual(
+            phone_app.STATE["loop"].session.snapshot.turn_count, turns_b)
+
+    def test_restart_restores_case_with_trajectory_and_budget(self):
+        _, fake = self.start_case(
+            script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        hid = phone_app.STATE["history_session_id"]
+        fake.stage(_cause("Cause A2"), _ask("Listen for fan noise."))
+        self.resume("The light is dark.")
+        steps_before = phone_app.STATE["last_result"].steps_used
+        self.assertEqual(phone_app.STATE["last_result"].outcome, LoopOutcome.NEEDS_INPUT)
+        self.simulate_restart()
+        store = phone_app.get_store()
+        self.assertEqual(store.get_session(hid)["archived"], 0)
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("open", body)
+        restore_fake = _StagedFake([
+            _ask("Check the indicator light."),
+            _ask("Inspect the charging port for debris."),
+        ])
+        with patch("phone_app.create_provider",
+                   return_value=(restore_fake, "Test Provider")):
+            switched = self.client.post(f"/case/{hid}/switch", follow_redirects=True)
+            switched_body = switched.get_data(as_text=True)
+            self.assertIn("Check the indicator light", switched_body)
+            self.assertIn("Session started", switched_body)
+            snapshot = phone_app.STATE["loop"].session.snapshot
+            self.assertEqual(snapshot.id, hid)
+            self.assertEqual(len(snapshot.evidence), 2)
+            revived = self.resume("No fan noise at all.")
+        final = revived.get_data(as_text=True)
+        self.assertIn("Do this next", final)
+        self.assertIn("charging port", final)
+        self.assertGreaterEqual(
+            phone_app.STATE["last_result"].steps_used, steps_before)
+
+    def test_corrupt_checkpoint_fails_safe_with_history_intact(self):
+        self.start_case(script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        hid = phone_app.STATE["history_session_id"]
+        store = phone_app.get_store()
+        store.save_checkpoint(hid, {"version": 1, "session": {"bogus": True}, "loop": {}})
+        self.simulate_restart()
+        response = self.client.post(f"/case/{hid}/switch", follow_redirects=True)
+        body = response.get_data(as_text=True)
+        self.assertIn("Something needs attention", body)
+        self.assertIsNone(phone_app.STATE["loop"])
+        live = phone_app.get_store()
+        events = live.get_events(hid)
+        self.assertTrue(any(e["title"] == "Session started" for e in events))
+
+    def test_solve_reopen_lifecycle_with_completed_case(self):
+        _, fake = self.start_case(script=[_cause("Dead battery.")])
+        hid = phone_app.STATE["history_session_id"]
+        evidence_id = f"{hid}:e1"
+        hypothesis_id = f"{hid}:h1"
+        fake.stage(
+            ToolCall("update_hypothesis", {
+                "hypothesis_id": hypothesis_id, "status": "supported",
+                "supporting": [evidence_id], "contradicting": [],
+                "resolutions": {}, "rationale": "No response at all.",
+            }),
+            ToolCall("submit_recommendation", {
+                "hypothesis_id": hypothesis_id,
+                "action": "Replace the battery.",
+                "evidence_ids": [evidence_id],
+                "acknowledged_contradictions": [],
+            }),
+        )
+        self.retry()
+        self.assertEqual(
+            phone_app.STATE["last_result"].outcome, LoopOutcome.COMPLETED)
+        solved = self.client.post(
+            f"/case/{hid}/solve", data={"note": "Battery replaced, device boots."},
+            follow_redirects=True,
+        )
+        self.assertIn("Case solved", solved.get_data(as_text=True))
+        self.retry()
+        self.assertEqual(phone_app.get_store().get_session(hid)["case_status"], "solved")
+        reopened = self.client.post(
+            f"/case/{hid}/reopen", data={"note": "Device died again."},
+            follow_redirects=True,
+        )
+        body = reopened.get_data(as_text=True)
+        self.assertNotIn("Case solved", body.split("Investigations")[0])
+        snapshot = phone_app.STATE["loop"].session.snapshot
+        self.assertEqual(snapshot.status, S.INVESTIGATING)
+        self.assertIsNotNone(snapshot.recommendation)
+        kinds = [e["title"] for e in phone_app.STATE["timeline"]]
+        self.assertIn("Marked solved", kinds)
+        self.assertIn("Case reopened", kinds)
+
+    def test_inconclusive_handoff_panel_is_honest(self):
+        _, fake = self.start_case(script=[_cause("Dead battery.")])
+        hid = phone_app.STATE["history_session_id"]
+        fake.stage(ToolCall("declare_inconclusive", {
+            "summary": "Power and charger checks showed nothing further.",
+            "checked_evidence_ids": [f"{hid}:e1"],
+            "remaining_possibilities": "Board failure.",
+            "safe_next_steps": "Take it to a repair shop.",
+        }))
+        response = self.retry()
+        body = response.get_data(as_text=True)
+        self.assertIn("Inconclusive", body)
+        self.assertIn("showed nothing further", body)
+        self.assertIn("repair shop", body)
+        self.assertNotIn("Verified recommendation", body)
+
+    def test_repeat_blocked_across_app_resume(self):
+        _, fake = self.start_case(
+            script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        fake.stage(
+            _ask("Check the  indicator light!!"),
+            _ask("Inspect the charging port for debris."),
+        )
+        self.resume("The light is dark.")
+        snapshot = phone_app.STATE["loop"].session.snapshot
+        self.assertEqual(snapshot.next_action.action,
+                         "Inspect the charging port for debris.")
+
+    def test_checkpoint_holds_no_secrets_or_photos(self):
+        self.start_case(script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        hid = phone_app.STATE["history_session_id"]
+        bundle = phone_app.get_store().load_checkpoint(hid)
+        self.assertEqual(
+            set(bundle),
+            {"version", "session", "loop", "timeline", "provider_label",
+             "last_outcome", "advance_note", "draft_answer"},
+        )
+        blob = json.dumps(bundle).lower()
+        for marker in ("api_key", "apikey", "secret", "token", "data:image"):
+            self.assertNotIn(marker, blob)
+
+    def test_archived_case_is_read_only_without_resume(self):
+        self.start_case(script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        hid = phone_app.STATE["history_session_id"]
+        store = phone_app.get_store()
+        store.archive_session(hid)
+        self.simulate_restart()
+        response = self.client.get(f"/history/{hid}")
+        body = response.get_data(as_text=True)
+        self.assertIn("archived · read-only", body)
+        self.assertNotIn("Resume investigation", body)
+        switched = self.client.post(f"/case/{hid}/switch", follow_redirects=True)
+        self.assertIn("archived · read-only", switched.get_data(as_text=True))
+        self.assertIsNone(phone_app.STATE["loop"])
 
 
 if __name__ == "__main__":

@@ -71,6 +71,15 @@ class PhoneAppTests(unittest.TestCase):
             response = self.client.post("/start", data={"problem": problem}, follow_redirects=True)
         return response, fake
 
+    def resume(self, answer, **extra):
+        data = {"case_id": phone_app.STATE["history_session_id"], "answer": answer}
+        data.update(extra)
+        return self.client.post("/resume", data=data, follow_redirects=True)
+
+    def retry(self):
+        data = {"case_id": phone_app.STATE["history_session_id"]}
+        return self.client.post("/retry", data=data, follow_redirects=True)
+
     def test_index_loads_without_session(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
@@ -152,7 +161,7 @@ class PhoneAppTests(unittest.TestCase):
         fake.stage(propose_cause("Cause B"))
         response = self.client.post(
             "/resume",
-            data={"answer": "The light is amber and blinking.", "image": (io.BytesIO(PNG_BYTES), "follow.png")},
+            data={"case_id": phone_app.STATE["history_session_id"], "answer": "The light is amber and blinking.", "image": (io.BytesIO(PNG_BYTES), "follow.png")},
             content_type="multipart/form-data",
             follow_redirects=True,
         )
@@ -167,9 +176,7 @@ class PhoneAppTests(unittest.TestCase):
     def test_resume_preserves_session_on_provider_error(self):
         _, fake = self.start_session(script=[propose_cause(), request_evidence()])
         fake.stage(ProviderError("Baseten HTTP 500: {secret blob}"))
-        response = self.client.post(
-            "/resume", data={"answer": "The light is amber."}, follow_redirects=True,
-        )
+        response = self.resume("The light is amber.")
         body = response.get_data(as_text=True)
         self.assertIn("trouble reaching the model", body)
         self.assertNotIn("secret blob", body)
@@ -190,7 +197,7 @@ class PhoneAppTests(unittest.TestCase):
         session_id = phone_app.STATE["loop"].session.snapshot.id
         self.assertEqual(phone_app.STATE["last_result"].steps_used, 14)
         fake.stage(propose_cause("Cause B"), request_evidence())
-        response = self.client.post("/retry", follow_redirects=True)
+        response = self.retry()
         self.assertIn("Do this next", response.get_data(as_text=True))
         snapshot = phone_app.STATE["loop"].session.snapshot
         self.assertEqual(snapshot.id, session_id)
@@ -217,8 +224,8 @@ class PhoneAppTests(unittest.TestCase):
     def test_double_resume_rejected_friendly(self):
         _, fake = self.start_session(script=[propose_cause(), request_evidence()])
         fake.stage(propose_cause("Cause B"))
-        self.client.post("/resume", data={"answer": "The light is amber."}, follow_redirects=True)
-        response = self.client.post("/resume", data={"answer": "Again."}, follow_redirects=True)
+        self.resume("The light is amber.")
+        response = self.resume("Again.")
         self.assertIn("Evidence rejected:", response.get_data(as_text=True))
         self.assertIsNotNone(phone_app.STATE["loop"])
 
@@ -245,10 +252,7 @@ class PhoneAppTests(unittest.TestCase):
         self.assertEqual(phone_app.STATE["last_result"].outcome, LoopOutcome.NEEDS_INPUT)
         calls_before = fake.decide_calls
         fake.stage(propose_cause("Cause after resume"), followup_evidence())
-        response = self.client.post(
-            "/resume", data={"answer": "The indicator light is steady green."},
-            follow_redirects=True,
-        )
+        response = self.resume("The indicator light is steady green.")
         body = response.get_data(as_text=True)
         self.assertGreater(fake.decide_calls, calls_before)
         self.assertEqual(phone_app.STATE["last_result"].outcome, LoopOutcome.NEEDS_INPUT)
@@ -266,8 +270,7 @@ class PhoneAppTests(unittest.TestCase):
                 propose_cause(f"Cause for {turn}"),
                 request_evidence(action, observations),
             )
-            response = self.client.post(
-                "/resume", data={"answer": turn}, follow_redirects=True)
+            response = self.resume(turn)
             self.assertIn("Do this next", response.get_data(as_text=True))
             self.assertEqual(
                 phone_app.STATE["last_result"].outcome, LoopOutcome.NEEDS_INPUT)
@@ -279,10 +282,7 @@ class PhoneAppTests(unittest.TestCase):
     def test_resume_shows_reassessment_note(self):
         _, fake = self.start_session(script=[propose_cause(), request_evidence()])
         fake.stage(propose_cause("Cause B"), followup_evidence())
-        response = self.client.post(
-            "/resume", data={"answer": "The light is steady green."},
-            follow_redirects=True,
-        )
+        response = self.resume("The light is steady green.")
         body = response.get_data(as_text=True)
         self.assertIn("New evidence recorded", body)
         self.assertIn("reassessed", body)
@@ -293,14 +293,14 @@ class PhoneAppTests(unittest.TestCase):
         self.assertEqual(
             phone_app.STATE["last_result"].outcome, LoopOutcome.ADVANCE_EXHAUSTED)
         for _ in range(4):
-            self.client.post("/retry", follow_redirects=True)
+            self.retry()
         result = phone_app.STATE["last_result"]
         self.assertEqual(result.outcome, LoopOutcome.BUDGET_EXHAUSTED)
         self.assertEqual(fake.decide_calls, 60)
         body = self.client.get("/").get_data(as_text=True)
         self.assertIn("full step budget", body)
         self.assertNotIn("Try again", body)
-        self.client.post("/retry", follow_redirects=True)
+        self.retry()
         self.assertEqual(fake.decide_calls, 60)
         self.assertEqual(phone_app.STATE["loop"].session.snapshot.turn_count, 1)
 
@@ -316,10 +316,7 @@ class PhoneAppTests(unittest.TestCase):
         self.assertTrue(titles[1].startswith("New cause considered ("))
         self.assertEqual(titles[2], "Test requested")
         fake.stage(propose_cause("Cause B"), followup_evidence())
-        response = self.client.post(
-            "/resume", data={"answer": "The light is steady green."},
-            follow_redirects=True,
-        )
+        response = self.resume("The light is steady green.")
         body = response.get_data(as_text=True)
         titles = [entry["title"] for entry in phone_app.STATE["timeline"]]
         self.assertIn("You reported", titles)
@@ -359,7 +356,7 @@ class PhoneAppTests(unittest.TestCase):
         answer = "The light is amber and blinking."
         response = self.client.post(
             "/resume",
-            data={"answer": answer, "image": (io.BytesIO(b"not an image"), "evil.exe")},
+            data={"case_id": phone_app.STATE["history_session_id"], "answer": answer, "image": (io.BytesIO(b"not an image"), "evil.exe")},
             content_type="multipart/form-data",
             follow_redirects=True,
         )
@@ -371,7 +368,7 @@ class PhoneAppTests(unittest.TestCase):
         self.assertEqual(loop.session.snapshot.status, S.NEEDS_INPUT)
 
 
-    def test_new_investigation_archives_previous_without_deleting(self):
+    def test_new_investigation_keeps_previous_open(self):
         self.start_session(problem="First problem", script=[propose_cause(), request_evidence()])
         first_id = phone_app.STATE["history_session_id"]
         self.assertIsNotNone(first_id)
@@ -381,7 +378,7 @@ class PhoneAppTests(unittest.TestCase):
         store = phone_app.get_store()
         sessions = {s["id"]: s for s in store.list_sessions()}
         self.assertEqual(set(sessions), {first_id, second_id})
-        self.assertEqual(sessions[first_id]["archived"], 1)
+        self.assertEqual(sessions[first_id]["archived"], 0)
         self.assertEqual(sessions[second_id]["archived"], 0)
         first_titles = [e["title"] for e in store.get_events(first_id)]
         self.assertIn("Session started", first_titles)
@@ -389,10 +386,14 @@ class PhoneAppTests(unittest.TestCase):
         body = self.client.get("/").get_data(as_text=True)
         self.assertIn("Investigation 1", body)
         self.assertIn("Investigation 2", body)
+        switched = self.client.post(f"/case/{first_id}/switch", follow_redirects=True)
+        self.assertIn("First problem", switched.get_data(as_text=True))
+        self.assertEqual(phone_app.STATE["history_session_id"], first_id)
 
     def test_archive_view_is_read_only(self):
         self.start_session(problem="First", script=[propose_cause(), request_evidence()])
         first_id = phone_app.STATE["history_session_id"]
+        phone_app.get_store().archive_session(first_id)
         self.start_session(problem="Second", script=[propose_cause(), request_evidence()])
         live_loop = phone_app.STATE["loop"]
         response = self.client.get(f"/history/{first_id}")
@@ -404,28 +405,29 @@ class PhoneAppTests(unittest.TestCase):
         self.assertNotIn("Submit & continue", body)
         self.assertNotIn('id="resumeForm"', body)
         self.assertNotIn('id="answerInput"', body)
+        self.assertNotIn("Resume investigation", body)
         self.assertIs(phone_app.STATE["loop"], live_loop)
         self.assertEqual(phone_app.STATE["loop"].session.snapshot.problem, "Second")
 
     def test_history_parity_no_fabrication(self):
         _, fake = self.start_session(script=[propose_cause(), request_evidence()])
         fake.stage(propose_cause("Cause B"), followup_evidence())
-        self.client.post("/resume", data={"answer": "The light is steady green."},
-                         follow_redirects=True)
+        self.resume("The light is steady green.")
         memory = [(e["kind"], e["title"], e["detail"]) for e in phone_app.STATE["timeline"]]
         stored = [(e["kind"], e["title"], e["detail"]) for e in phone_app.get_store().get_events(
             phone_app.STATE["history_session_id"])]
         self.assertEqual(stored, memory)
         self.assertGreater(len(stored), 4)
 
-    def test_restart_reopen_keeps_history(self):
+    def test_restart_keeps_checkpointed_case_open(self):
         self.start_session(script=[propose_cause(), request_evidence()])
         hid = phone_app.STATE["history_session_id"]
         reopened = HistoryStore(phone_app.get_store().path)
         events = reopened.get_events(hid)
         self.assertEqual([e["title"] for e in events],
                          [e["title"] for e in phone_app.STATE["timeline"]])
-        self.assertEqual(reopened.get_session(hid)["archived"], 1)
+        self.assertEqual(reopened.get_session(hid)["archived"], 0)
+        self.assertIsNotNone(reopened.load_checkpoint(hid))
 
     def test_photo_bytes_never_persisted(self):
         def factory(image):
@@ -501,8 +503,7 @@ class PhoneAppTests(unittest.TestCase):
     def test_user_recents_styled_distinctly(self):
         _, fake = self.start_session(script=[propose_cause(), request_evidence()])
         fake.stage("garbage")
-        self.client.post("/resume", data={"answer": "The light is steady green."},
-                         follow_redirects=True)
+        self.resume("The light is steady green.")
         body = self.client.get("/").get_data(as_text=True)
         self.assertIn("recent-user", body)
         self.assertIn("You reported", body)

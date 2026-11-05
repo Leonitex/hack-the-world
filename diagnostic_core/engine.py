@@ -369,8 +369,10 @@ def _restore_hypotheses(items, prefix, by_id):
         hid = item.get("id")
         if not is_text(hid) or not hid.startswith(prefix):
             raise Rejected("Checkpoint hypothesis id is invalid")
-        if not is_text(item.get("cause")) or not is_text(item.get("rationale")):
+        if not is_text(item.get("cause")):
             raise Rejected("Checkpoint hypothesis text is invalid")
+        if not isinstance(item.get("rationale"), str):
+            raise Rejected("Checkpoint hypothesis rationale is invalid")
         try:
             status = H(item.get("status"))
         except ValueError:
