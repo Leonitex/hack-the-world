@@ -5,15 +5,87 @@ HTW_PROVIDER controls the choice: "meta" or "baseten" select explicitly,
 present and falls back to Meta Model API when only MODEL_API_KEY (or the
 legacy META_MODEL_API_KEY) is present. Only key presence is inspected
 here; key values stay with the providers that read them.
+
+HTW_E2E_FAKE_PROVIDER=1 overrides every choice above with a deterministic
+scripted FakeProvider for browser E2E. It makes no network calls and needs
+no keys. Any other value (including unset) leaves normal selection alone.
+Never enable it for a real diagnosis.
+
+The fixture serves a fixed multi-turn script by default. A problem
+statement containing "e2e-repeat" selects the repeat-guard script
+instead, in which the scripted model asks the same test twice so the
+browser gate can prove the duplicate is blocked and a distinct follow-up
+is presented.
 """
 
 import os
 
 from .baseten import BasetenMuseProvider
 from .meta_provider import MetaProvider
-from .providers import ProviderError
+from .providers import FakeProvider, ProviderError, ToolCall
 
 CHOICE_ENV_VAR = "HTW_PROVIDER"
+E2E_ENV_VAR = "HTW_E2E_FAKE_PROVIDER"
+E2E_REPEAT_MARKER = "e2e-repeat"
+
+
+def e2e_script():
+    """Fixed scripted decisions driving the multi-turn browser E2E flows."""
+    return [
+        ToolCall("propose_hypothesis", {"cause": "E2E Cause A"}),
+        ToolCall("propose_hypothesis", {"cause": "E2E Cause B"}),
+        ToolCall("request_user_evidence", {
+            "action": "E2E check one: report the indicator light.",
+            "observations": ["E2E observation one."],
+        }),
+        ToolCall("propose_hypothesis", {"cause": "E2E Cause C"}),
+        ToolCall("request_user_evidence", {
+            "action": "E2E check two: report the startup sound.",
+            "observations": ["E2E observation two."],
+        }),
+        ToolCall("propose_hypothesis", {"cause": "E2E Cause D"}),
+        ToolCall("request_user_evidence", {
+            "action": "E2E check three: report the charging port.",
+            "observations": ["E2E observation three."],
+        }),
+    ]
+
+
+def e2e_repeat_script():
+    """Repeat-guard script: the model re-asks an answered test verbatim."""
+    return [
+        ToolCall("propose_hypothesis", {"cause": "E2E Cause A"}),
+        ToolCall("request_user_evidence", {
+            "action": "E2E repeat check: report the indicator light.",
+            "observations": ["E2E repeat observation."],
+        }),
+        ToolCall("request_user_evidence", {
+            "action": "E2E repeat check: report the indicator light.",
+            "observations": ["E2E repeat observation."],
+        }),
+        ToolCall("request_user_evidence", {
+            "action": "E2E distinct follow-up: report the startup sound.",
+            "observations": ["E2E distinct observation."],
+        }),
+    ]
+
+
+class E2EFakeProvider(FakeProvider):
+    """Fixture provider selecting its fixed script from the problem text."""
+
+    def __init__(self):
+        super().__init__([])
+        self._primed = False
+
+    def decide(self, request):
+        if not self._primed:
+            self._primed = True
+            problem = getattr(request, "problem", "") or ""
+            if E2E_REPEAT_MARKER in problem.lower():
+                self._script.extend(e2e_repeat_script())
+            else:
+                self._script.extend(e2e_script())
+        return super().decide(request)
 
 
 def _meta_key_present():
@@ -22,6 +94,8 @@ def _meta_key_present():
 
 def create_provider(image_data_url=None):
     """Create (provider, ui_label) from HTW_PROVIDER and available keys."""
+    if (os.environ.get(E2E_ENV_VAR) or "").strip() == "1":
+        return E2EFakeProvider(), "Deterministic E2E fixture (fake, no network)"
     choice = (os.environ.get(CHOICE_ENV_VAR) or "auto").strip().lower()
     if choice == "meta":
         provider = MetaProvider(image_data_url=image_data_url)

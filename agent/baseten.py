@@ -30,6 +30,8 @@ Rules:
 9. Do not claim certainty that the recorded evidence does not support.
 10. Never recommend from the initial complaint alone; obtain at least one follow-up observation or diagnostic test result.
 11. A supplied image is context for choosing better questions/tests, not permission to invent evidence. If a visible detail matters, ask the user to confirm it.
+12. The completed test history below is authoritative: never request the same test twice, and treat a negative result as a real finding. If a result is ambiguous, ask one genuinely clarifying question.
+13. When no further safe test can narrow the problem, declare the investigation inconclusive with checked evidence instead of guessing.
 """
 
 
@@ -87,12 +89,19 @@ class BasetenMuseProvider(Provider):
             indent=2,
             default=str,
         )
+        trajectory_json = json.dumps(
+            [asdict(step) for step in request.trajectory],
+            indent=2,
+            default=str,
+        )
 
         instruction = (
             "Choose the single best next diagnostic action.\n\n"
             f"{_phase_hint(request.session)}\n\n"
             f"Problem:\n{request.problem}\n\n"
             f"Authoritative session state:\n{state_json}\n\n"
+            f"Completed test history (request text tied to its real result):\n"
+            f"{trajectory_json}\n\n"
             f"Recent execution feedback:\n{feedback_json}\n\n"
             f"Remaining provider steps: {request.remaining_provider_steps}\n"
         )

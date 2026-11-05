@@ -37,6 +37,11 @@ TOOL_DESCRIPTIONS = {
         "Attempt completion with a recommended action grounded in cited "
         "session evidence. Mandatory verification runs synchronously."
     ),
+    "declare_inconclusive": (
+        "Honestly end the investigation when no further safe test can "
+        "narrow the problem: cite the checked evidence and hand off with "
+        "remaining possibilities and safe next steps. Never a diagnosis."
+    ),
 }
 
 FIELD_DESCRIPTIONS = {
@@ -58,6 +63,16 @@ FIELD_DESCRIPTIONS = {
     ("submit_recommendation", "evidence_ids"): "Session evidence IDs supporting the recommendation.",
     ("submit_recommendation", "acknowledged_contradictions"): (
         "Unresolved contradicting evidence IDs being surfaced, not hidden."
+    ),
+    ("declare_inconclusive", "summary"): "Why testing cannot narrow further.",
+    ("declare_inconclusive", "checked_evidence_ids"): (
+        "Session evidence IDs for the tests already performed."
+    ),
+    ("declare_inconclusive", "remaining_possibilities"): (
+        "What remains possible after the checked evidence."
+    ),
+    ("declare_inconclusive", "safe_next_steps"): (
+        "Safe user steps or technician referral, not a diagnosis."
     ),
 }
 

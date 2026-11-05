@@ -84,7 +84,14 @@ DEVELOPER_INSTRUCTION = (
     "observation instead of guessing. "
     "Never claim certainty beyond what the cited evidence supports. "
     "Submit a recommendation only when a hypothesis is sufficiently "
-    "supported by cited session evidence."
+    "supported by cited session evidence. "
+    "Already-completed tests and their results are listed below: never "
+    "request the same or an equivalent test again. "
+    "Treat a negative observation as a real finding, not a reason to "
+    "repeat the test; if an observation is ambiguous, ask one genuinely "
+    "clarifying question instead. "
+    "When no further safe test can narrow the problem, declare the "
+    "investigation inconclusive with checked evidence instead of guessing."
 )
 
 
@@ -119,8 +126,9 @@ def render_state(request):
     """Render a bounded, deterministic, model-facing state summary.
 
     Evidence and hypotheses are bounded by the core turn budget; feedback
-    arrives pre-windowed by the loop. Only plain values and stable IDs are
-    exposed, never Python internals.
+    arrives pre-windowed by the loop. The completed-test trajectory always
+    renders in full so answered tests are never forgotten. Only plain
+    values and stable IDs are exposed, never Python internals.
     """
     session = request.session
     lines = [
@@ -132,7 +140,10 @@ def render_state(request):
         "Evidence:",
     ]
     for item in session.evidence:
-        lines.append(f"- [{item.id}] ({item.source}) {item.statement}")
+        line = f"- [{item.id}] ({item.source}) {item.statement}"
+        if item.request_id is not None:
+            line += f" [via {item.request_id}]"
+        lines.append(line)
     if not session.evidence:
         lines.append("- none recorded")
     lines += ["", "Hypotheses:"]
@@ -157,6 +168,14 @@ def render_state(request):
         lines.append(f"- kind: {pending.kind}; action: {pending.action}")
         for question in pending.observations:
             lines.append(f"  - {question}")
+    lines += ["", "Completed tests:"]
+    for step in request.trajectory:
+        lines.append(f"- [{step.request_id}] ({step.kind}) {step.action}")
+        asked = "; ".join(step.observations)
+        lines.append(f"  asked: {asked}")
+        lines.append(f"  result [{step.evidence_id}]: {step.statement}")
+    if not request.trajectory:
+        lines.append("- none completed yet")
     lines += ["", "Recent feedback:"]
     for entry in request.feedback:
         lines.append(_render_feedback(entry))

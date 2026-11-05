@@ -8,10 +8,10 @@ import os
 from flask import Flask, redirect, render_template_string, request, url_for
 
 from agent.factory import create_provider
-from agent.loop import AgentLoop, LoopOutcome
+from agent.loop import AgentLoop, LoopOutcome, LoopResult
 from agent.providers import ProviderError
 from diagnostic_core.engine import DiagnosticSession
-from diagnostic_core.models import Rejected
+from diagnostic_core.models import Rejected, SessionStatus as S
 from history_store import HistoryStore
 
 app = Flask(__name__)
@@ -19,7 +19,9 @@ app = Flask(__name__)
 STATE = {"loop": None, "last_result": None, "error": None, "provider": None,
          "provider_label": None, "images": {}, "advance_note": None,
          "timeline": [], "draft_problem": "", "draft_answer": "",
-         "history_session_id": None}
+         "history_session_id": None, "active_id": None, "cases": {}}
+
+CHECKPOINT_BUNDLE_VERSION = 1
 
 # Per-round decision allowance vs session-wide billed-step cap. Each user
 # result grants a fresh advance; the session cap keeps retries bounded.
@@ -186,20 +188,20 @@ body { line-height:1.5; }
 <div class="bg-glow-a"></div><div class="bg-glow-b"></div>
 {% macro assistant_hero() %}<div class="card"><div class="hero">
 <div class="orb-wrap" role="img" aria-label="Assistant status"><div class="orb-sweep"></div><div class="orb-scanline"></div><svg class="orb-svg" viewBox="0 0 240 240" aria-hidden="true"><defs><radialGradient id="orbCore" cx="38%" cy="32%" r="75%"><stop offset="0%" stop-color="#e8fbff"/><stop offset="18%" stop-color="#7fdcff"/><stop offset="45%" stop-color="#4f79e8"/><stop offset="72%" stop-color="#232a55"/><stop offset="100%" stop-color="#0c1226"/></radialGradient><radialGradient id="orbCoreError" cx="38%" cy="32%" r="75%"><stop offset="0%" stop-color="#ffe8ec"/><stop offset="25%" stop-color="#ff8b98"/><stop offset="55%" stop-color="#a83a4a"/><stop offset="100%" stop-color="#2a0e14"/></radialGradient><radialGradient id="orbHalo" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#66d9ff" stop-opacity=".28"/><stop offset="55%" stop-color="#8b7cff" stop-opacity=".1"/><stop offset="100%" stop-color="#8b7cff" stop-opacity="0"/></radialGradient><linearGradient id="orbArc" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#66d9ff"/><stop offset="100%" stop-color="#8b7cff"/></linearGradient></defs><circle cx="120" cy="120" r="112" fill="url(#orbHalo)" class="orb-breathe"/><g class="orb-spin-a"><circle cx="120" cy="120" r="86" fill="none" stroke="url(#orbArc)" stroke-width="2.5" stroke-dasharray="52 26 12 26" stroke-linecap="round" opacity=".9"/></g><g class="orb-spin-b"><circle cx="120" cy="120" r="70" fill="none" stroke="#66d9ff" stroke-width="1.5" stroke-dasharray="4 10" opacity=".55"/></g><g class="orb-spin-d"><circle cx="120" cy="120" r="98" fill="none" stroke="#8b7cff" stroke-width="1" stroke-dasharray="26 18 6 18" opacity=".4"/></g><g class="orb-spin-c"><circle cx="120" cy="34" r="7" fill="#8fe9ff" opacity=".25"/><circle cx="120" cy="34" r="3.5" fill="#8fe9ff"/><circle cx="120" cy="206" r="6" fill="#8fe9ff" opacity=".2"/><circle cx="120" cy="206" r="3" fill="#8fe9ff"/></g><circle cx="120" cy="120" r="46" fill="url(#orbCore)" class="orb-core"/><circle cx="120" cy="120" r="29" fill="url(#orbCore)" class="orb-inner"/><ellipse cx="104" cy="102" rx="20" ry="12" fill="#ffffff" opacity=".28" transform="rotate(-24 104 102)"/><g fill="#9fdcff"><circle cx="52" cy="88" r="1.6" class="orb-p1"/><circle cx="188" cy="96" r="1.3" class="orb-p2"/><circle cx="60" cy="160" r="1.4" class="orb-p3"/><circle cx="182" cy="162" r="1.7" class="orb-p4"/></g></svg><div class="orb-label" id="orbLabel">Ready</div></div>
-<div class="orb-sub" id="orbSub">{% if error %}Needs attention{% elif session.next_action %}Next test ready{% elif session.recommendation %}Verified recommendation ready{% elif session %}Reviewing evidence{% else %}Ready{% endif %}</div>
-<div class="bubble" id="assistantBubble" aria-live="polite"><div class="state" id="assistantState">{% if error %}Attention{% elif session and session.recommendation %}Verified{% elif session and session.next_action %}Next diagnostic step{% elif session %}Investigating{% else %}Ready{% endif %}</div><div class="message" id="assistantMessage">{% if error %}{{ error }}{% elif session and session.recommendation %}{{ session.recommendation.action }}{% elif session and session.next_action %}{{ session.next_action.action }}{% elif session %}I am reviewing the evidence and testing competing causes.{% else %}Tell me what the device is doing. You can speak, type, or add a photo.{% endif %}</div></div>
+<div class="orb-sub" id="orbSub">{% if error %}Needs attention{% elif session.next_action %}Next test ready{% elif session.recommendation %}Verified recommendation ready{% elif session.inconclusive %}Handoff ready{% elif session %}Reviewing evidence{% else %}Ready{% endif %}</div>
+<div class="bubble" id="assistantBubble" aria-live="polite"><div class="state" id="assistantState">{% if error %}Attention{% elif session and session.recommendation %}Verified{% elif session and session.next_action %}Next diagnostic step{% elif session and session.inconclusive %}Inconclusive{% elif session %}Investigating{% else %}Ready{% endif %}</div><div class="message" id="assistantMessage">{% if error %}{{ error }}{% elif session and session.recommendation %}{{ session.recommendation.action }}{% elif session and session.next_action %}{{ session.next_action.action }}{% elif session and session.inconclusive %}{{ session.inconclusive.summary }}{% elif session %}I am reviewing the evidence and testing competing causes.{% else %}Tell me what the device is doing. You can speak, type, or add a photo.{% endif %}</div></div>
 {% if recents %}<div class="recents">{% for pos, entry in recents %}<a class="recent-bubble{% if entry.kind == 'user' %} recent-user{% endif %}" href="#t-{{ pos }}"><strong>{{ entry.title }}</strong><span>{{ entry.detail }}</span></a>{% endfor %}</div>{% endif %}
 <div class="controls"><button type="button" class="secondary" id="speakButton" onclick="speakCurrent()">Hear instruction</button><button type="button" class="secondary" id="stopButton" onclick="stopSpeech()">Stop</button><button type="button" class="secondary" id="handsFreeButton" onclick="toggleHandsFree()">Hands-free: off</button></div>
 <div class="voice-note" id="voiceSupport" role="status"></div>
 </div></div>{% endmacro %}
-{% macro session_list(title) %}<h2>{{ title }}</h2><ul class="sessions">{% for s in sessions %}<li><a href="{{ url_for('view_history', session_id=s.id) }}">{{ s.name }}</a> <span class="badge">{% if s.archived %}archived{% else %}live{% endif %}</span><div class="muted">{{ s.updated_at[:16].replace("T", " ") }} UTC</div></li>{% endfor %}</ul>{% endmacro %}
+{% macro session_list(title) %}<h2>{{ title }}</h2><ul class="sessions">{% for s in sessions %}<li><a href="{{ url_for('view_history', session_id=s.id) }}">{{ s.name }}</a> <span class="badge">{% if s.archived %}archived{% elif s.case_status == "solved" %}solved{% elif s.case_status == "awaiting" %}awaiting result{% elif s.case_status == "inconclusive" %}inconclusive{% else %}open{% endif %}</span>{% if s.id == active_id %} <span class="badge">current</span>{% endif %}{% if not s.archived and s.id != active_id %}<form method="post" action="{{ url_for('switch_case', hid=s.id) }}" style="display:inline;margin-left:6px"><button type="submit" class="secondary" style="min-height:0;padding:4px 10px;font-size:12px">Open</button></form>{% endif %}<div class="muted">{{ s.updated_at[:16].replace("T", " ") }} UTC</div></li>{% endfor %}</ul>{% endmacro %}
 <main>
 <header class="top"><div class="brand">Hack the World<small>Evidence-driven field diagnostics</small></div><div class="meta">{{ provider_label or "Meta Muse" }}</div></header>
 {% if error %}<div class="strip"><div class="card error" id="errorCard" tabindex="-1"><strong>Something needs attention</strong><div>{{ error }}</div></div></div>{% endif %}
 {% if advance_note %}<div class="strip"><div class="card next">{{ advance_note }}</div></div>{% endif %}
-{% if result and (result.outcome.value == "provider_error" or result.outcome.value == "advance_exhausted") %}<div class="strip"><form method="post" action="{{ url_for('retry') }}"><button type="submit" class="secondary" style="width:100%">Try again</button></form></div>{% endif %}
+{% if result and case_status != "solved" and (result.outcome.value == "provider_error" or result.outcome.value == "advance_exhausted") %}<div class="strip"><form method="post" action="{{ url_for('retry') }}"><input type="hidden" name="case_id" value="{{ active_id }}"><button type="submit" class="secondary" style="width:100%">Try again</button></form></div>{% endif %}
 {% if viewing %}
-<div class="strip"><div class="card"><h2>{{ viewing.session.name }}</h2><div class="badges"><span class="badge">{% if viewing.session.archived %}archived · read-only{% else %}live{% endif %}</span><span class="badge">{{ viewing.events|length }} events</span></div><div class="muted">{{ viewing.session.problem }}</div><form method="post" action="{{ url_for('rename_history', session_id=viewing.session.id) }}"><div class="rename-row"><input type="text" name="name" value="{{ viewing.session.name }}" maxlength="80" aria-label="Session name"><button type="submit" class="secondary">Rename</button></div></form><div style="margin-top:10px"><a href="{{ url_for('index') }}">{% if session %}Back to live investigation{% else %}Back{% endif %}</a></div></div></div>
+<div class="strip"><div class="card"><h2>{{ viewing.session.name }}</h2><div class="badges"><span class="badge">{% if viewing.session.archived %}archived · read-only{% elif viewing.session.case_status == "solved" %}solved{% elif viewing.session.case_status == "awaiting" %}awaiting result{% elif viewing.session.case_status == "inconclusive" %}inconclusive{% else %}open{% endif %}</span><span class="badge">{{ viewing.events|length }} events</span></div><div class="muted">{{ viewing.session.problem }}</div><form method="post" action="{{ url_for('rename_history', session_id=viewing.session.id) }}"><div class="rename-row"><input type="text" name="name" value="{{ viewing.session.name }}" maxlength="80" aria-label="Session name"><button type="submit" class="secondary">Rename</button></div></form>{% if can_resume %}<form method="post" action="{{ url_for('switch_case', hid=viewing.session.id) }}"><button type="submit" style="width:100%;margin-top:10px">Resume investigation</button></form>{% endif %}{% if viewing.session.case_status == "solved" and not viewing.session.archived %}<form method="post" action="{{ url_for('reopen_case', hid=viewing.session.id) }}"><button type="submit" class="secondary" style="width:100%;margin-top:10px">Reopen case</button></form>{% endif %}<div style="margin-top:10px"><a href="{{ url_for('index') }}">{% if session %}Back to live investigation{% else %}Back{% endif %}</a></div></div></div>
 <div class="strip"><div class="card"><h2>Timeline</h2>{% if viewing.events %}<ol class="timeline">{% for entry in viewing.events %}<li class="t-event"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>#{{ entry.seq }} · {{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div><div class="muted">{{ entry.created_at[:16].replace("T", " ") }} UTC</div></div></li>{% endfor %}</ol>{% else %}<div class="muted">No events recorded yet.</div>{% endif %}</div></div>
 {% elif not session %}
 <div class="strip">{{ assistant_hero() }}</div>
@@ -210,8 +212,10 @@ body { line-height:1.5; }
 <section class="zone-assistant" aria-label="Assistant">
 <div class="card"><div class="badges"><span class="badge">{{ session.status }}</span><span class="badge">{{ session.turn_count }} diagnostic turns</span><span class="badge">{{ result.steps_used if result else 0 }} Muse steps</span><span class="badge">{{ result.advance_steps if result else 0 }} steps this round</span><span class="badge">{{ result.outcome.value if result else "started" }}</span></div><div class="progress"><div class="step done">Observe</div><div class="step {% if session.hypotheses %}done{% else %}active{% endif %}">Hypothesize</div><div class="step {% if session.next_action %}active{% elif session.recommendation %}done{% endif %}">Test</div><div class="step {% if session.recommendation %}done{% elif session.hypotheses and not session.next_action %}active{% endif %}">Verify</div><div class="step {% if session.recommendation %}active{% endif %}">Fix</div></div><h3>Device problem</h3><div>{{ session.problem }}</div></div>
 {{ assistant_hero() }}
-{% if session.next_action %}<div class="card next"><h2>Do this next</h2><p class="big-action"><strong>{{ session.next_action.action }}</strong></p>{% if session.next_action.observations %}<div class="muted">Report:</div><ul>{% for o in session.next_action.observations %}<li>{{ o }}</li>{% endfor %}</ul>{% endif %}<form id="resumeForm" class="composer" method="post" action="{{ url_for('resume') }}" enctype="multipart/form-data"><label>What happened?</label><textarea id="answerInput" name="answer" required placeholder="Tell me exactly what you observed.">{{ draft_answer }}</textarea><div class="filebox" style="margin-top:10px"><input id="answerImageInput" type="file" name="image" accept="image/*" capture="environment"><small>Optional follow-up photo of what you observed.</small></div><div class="composer-row"><button type="button" id="answerMic" class="secondary" onclick="startDictation('answerInput', this)">Speak result</button><button type="submit">Submit & continue</button></div></form></div>{% endif %}
+{% if session.next_action %}<div class="card next"><h2>Do this next</h2><p class="big-action"><strong>{{ session.next_action.action }}</strong></p>{% if session.next_action.observations %}<div class="muted">Report:</div><ul>{% for o in session.next_action.observations %}<li>{{ o }}</li>{% endfor %}</ul>{% endif %}{% if case_status != "solved" %}<form id="resumeForm" class="composer" method="post" action="{{ url_for('resume') }}" enctype="multipart/form-data"><input type="hidden" name="case_id" value="{{ active_id }}"><label>What happened?</label><textarea id="answerInput" name="answer" required placeholder="Tell me exactly what you observed.">{{ draft_answer }}</textarea><div class="filebox" style="margin-top:10px"><input id="answerImageInput" type="file" name="image" accept="image/*" capture="environment"><small>Optional follow-up photo of what you observed.</small></div><div class="composer-row"><button type="button" id="answerMic" class="secondary" onclick="startDictation('answerInput', this)">Speak result</button><button type="submit">Submit & continue</button></div></form>{% endif %}</div>{% endif %}
 {% if session.recommendation %}<div class="card final"><h2>Verified recommendation</h2><p class="big-action">{{ session.recommendation.action }}</p><small>Grounded in {{ session.recommendation.evidence_ids|length }} recorded evidence item(s).</small></div>{% endif %}
+{% if session.inconclusive %}<div class="card"><h2>Inconclusive handoff</h2><p class="big-action">{{ session.inconclusive.summary }}</p><div class="muted">Checked {{ session.inconclusive.checked_evidence_ids|length }} recorded evidence item(s); this is not a verified diagnosis.</div><h3>Still possible</h3><div>{{ session.inconclusive.remaining_possibilities }}</div><h3>Safe next steps</h3><div>{{ session.inconclusive.safe_next_steps }}</div></div>{% endif %}
+{% if case_status == "solved" %}<div class="card"><h2>Case solved</h2><div class="muted">{{ solved_note or "The technician marked this case solved." }}</div><form method="post" action="{{ url_for('reopen_case', hid=active_id) }}"><button type="submit" class="secondary" style="width:100%;margin-top:10px">Reopen case</button></form></div>{% elif session %}<form method="post" action="{{ url_for('solve_case', hid=active_id) }}"><div class="rename-row"><input type="text" name="note" maxlength="200" placeholder="Repair note (optional)" aria-label="Repair note"><button type="submit" class="secondary">Mark solved</button></div></form>{% endif %}
 <form method="post" action="{{ url_for('reset') }}"><button type="submit" class="secondary" style="width:100%">Start a new investigation</button></form>
 </section>
 <section class="zone-timeline" aria-label="Investigation history"><details class="drawer"><summary>History & timeline</summary><div class="drawer-body">{% if sessions %}<div class="card sticky">{{ session_list("Investigations") }}</div>{% endif %}{% if timeline %}<div class="card"><h2>Timeline</h2><ol class="timeline">{% for entry in timeline %}<li class="t-event" id="t-{{ loop.index }}"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>{{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div></div></li>{% endfor %}</ol></div>{% endif %}</div></details></section>
@@ -335,6 +339,11 @@ def _record_timeline(before, after, user_text=None):
     if after.recommendation is not None and (before is None or before.recommendation is None):
         _append_entry("recommendation", "✓", "Verified recommendation",
                       after.recommendation.action, after.recommendation.hypothesis_id)
+    if after.inconclusive is not None and (
+        before is None or before.inconclusive != after.inconclusive
+    ):
+        _append_entry("handoff", "⚐", "Inconclusive handoff",
+                      after.inconclusive.summary)
     del STATE["timeline"][:-TIMELINE_LIMIT]
 
 
@@ -352,9 +361,217 @@ def _recent_entries():
     return [(start + index, entry) for index, entry in enumerate(tail)]
 
 
+def _park_active():
+    """Stash the live view into the case registry; the case stays open."""
+    hid = STATE["history_session_id"]
+    if hid is None:
+        return
+    STATE["cases"][hid] = {
+        "loop": STATE["loop"], "provider": STATE["provider"],
+        "provider_label": STATE["provider_label"], "images": STATE["images"],
+        "timeline": STATE["timeline"], "last_result": STATE["last_result"],
+        "advance_note": STATE["advance_note"], "draft_answer": STATE["draft_answer"],
+    }
+
+
+def _load_case(hid):
+    """Make a registered case the live view."""
+    bundle = STATE["cases"][hid]
+    STATE["loop"] = bundle["loop"]
+    STATE["provider"] = bundle["provider"]
+    STATE["provider_label"] = bundle["provider_label"]
+    STATE["images"] = bundle["images"]
+    STATE["timeline"] = bundle["timeline"]
+    STATE["last_result"] = bundle["last_result"]
+    STATE["advance_note"] = bundle["advance_note"]
+    STATE["draft_answer"] = bundle["draft_answer"]
+    STATE["draft_problem"] = ""
+    STATE["error"] = None
+    STATE["history_session_id"] = hid
+    STATE["active_id"] = hid
+
+
+def _clear_flats():
+    STATE["loop"] = None
+    STATE["last_result"] = None
+    STATE["error"] = None
+    STATE["provider"] = None
+    STATE["provider_label"] = None
+    STATE["images"] = {}
+    STATE["advance_note"] = None
+    STATE["timeline"] = []
+    STATE["draft_problem"] = ""
+    STATE["draft_answer"] = ""
+    STATE["history_session_id"] = None
+    STATE["active_id"] = None
+
+
+def _checkpoint_bundle():
+    result = STATE["last_result"]
+    return {
+        "version": CHECKPOINT_BUNDLE_VERSION,
+        "session": STATE["loop"].session.to_checkpoint(),
+        "loop": STATE["loop"].capture_bookkeeping(),
+        "timeline": [dict(entry) for entry in STATE["timeline"]],
+        "provider_label": STATE["provider_label"],
+        "last_outcome": (
+            None if result is None else {
+                "outcome": result.outcome.value,
+                "steps_used": result.steps_used,
+                "message": result.message,
+                "advance_steps": result.advance_steps,
+            }
+        ),
+        "advance_note": STATE["advance_note"],
+        "draft_answer": STATE["draft_answer"],
+    }
+
+
+def _save_case_checkpoint(hid):
+    get_store().save_checkpoint(hid, _checkpoint_bundle())
+
+
+def _sync_case_status(hid, result):
+    """Mirror the AI outcome in the case row; never touch solved cases.
+
+    Diagnostic states map explicitly; transient provider/advance/budget
+    outcomes leave the current status alone so a retryable failure cannot
+    erase an informative state like "awaiting result".
+    """
+    if result is None:
+        return
+    row = get_store().get_session(hid)
+    if row is None or row["case_status"] == "solved":
+        return
+    status = {
+        LoopOutcome.NEEDS_INPUT: "awaiting",
+        LoopOutcome.INCONCLUSIVE: "inconclusive",
+        LoopOutcome.COMPLETED: "open",
+        LoopOutcome.PAUSED: "open",
+    }.get(result.outcome)
+    if status is None:
+        return
+    get_store().set_case_status(hid, status)
+
+
+def _case_is_solved(hid):
+    row = get_store().get_session(hid)
+    return row is not None and row["case_status"] == "solved"
+
+
+def _restore_timeline(entries):
+    if not isinstance(entries, list):
+        raise Rejected("Checkpoint timeline is invalid")
+    restored = []
+    for entry in entries:
+        if (not isinstance(entry, dict)
+                or any(not isinstance(entry.get(key), str)
+                       for key in ("glyph", "kind", "title", "detail"))
+                or (entry.get("record") is not None
+                    and not isinstance(entry.get("record"), str))):
+            raise Rejected("Checkpoint timeline is invalid")
+        restored.append({
+            "glyph": entry["glyph"], "kind": entry["kind"],
+            "title": entry["title"], "detail": entry["detail"],
+            "record": entry["record"],
+        })
+    return restored[-TIMELINE_LIMIT:]
+
+
+def _restore_result(data, snapshot):
+    if data is None:
+        return None
+    try:
+        outcome = LoopOutcome(data["outcome"])
+    except (KeyError, ValueError):
+        raise Rejected("Checkpoint outcome is invalid") from None
+    for key in ("steps_used", "advance_steps"):
+        if type(data.get(key)) is not int or data[key] < 0:
+            raise Rejected("Checkpoint outcome is invalid")
+    if not isinstance(data.get("message"), str):
+        raise Rejected("Checkpoint outcome is invalid")
+    return LoopResult(outcome, snapshot, data["steps_used"], data["message"],
+                      data["advance_steps"])
+
+
+def _restore_case(hid):
+    """Rebuild a parked case from its checkpoint. Returns an error or None."""
+    store = get_store()
+    row = store.get_session(hid)
+    if row is None:
+        return "Investigation not found."
+    if row["archived"]:
+        return "That investigation is archived and read-only."
+    try:
+        bundle = store.load_checkpoint(hid)
+    except ValueError as exc:
+        print(f"[phone_app] checkpoint undecodable for {hid}: {exc}", flush=True)
+        return ("Saved state for that investigation failed validation; "
+                "its history is preserved read-only.")
+    if bundle is None:
+        return ("No restorable state for that investigation; "
+                "its history is preserved read-only.")
+    try:
+        if not isinstance(bundle, dict) or bundle.get("version") != CHECKPOINT_BUNDLE_VERSION:
+            raise Rejected("Checkpoint bundle version is invalid")
+        session = DiagnosticSession.from_checkpoint(bundle["session"])
+        provider, label = create_provider(None)
+        loop = AgentLoop(
+            session, provider,
+            max_provider_steps=SESSION_STEP_BUDGET,
+            max_advance_steps=ADVANCE_STEP_BUDGET,
+        )
+        loop.apply_bookkeeping(bundle["loop"])
+        timeline = _restore_timeline(bundle["timeline"])
+        last_result = _restore_result(bundle["last_outcome"], session.snapshot)
+        advance_note = bundle["advance_note"]
+        draft_answer = bundle["draft_answer"]
+        provider_label = bundle["provider_label"]
+        if advance_note is not None and not isinstance(advance_note, str):
+            raise Rejected("Checkpoint note is invalid")
+        if not isinstance(draft_answer, str) or not isinstance(provider_label, str):
+            raise Rejected("Checkpoint view state is invalid")
+    except ProviderError as exc:
+        print(f"[phone_app] restore needs provider: {exc}", flush=True)
+        return _friendly_error(exc)
+    except (Rejected, ValueError, KeyError, TypeError) as exc:
+        print(f"[phone_app] restore rejected for {hid}: {exc}", flush=True)
+        return ("Saved state for that investigation failed validation; "
+                "its history is preserved read-only.")
+    store.adopt_session(hid)
+    STATE["cases"][hid] = {
+        "loop": loop, "provider": provider, "provider_label": provider_label,
+        "images": {}, "timeline": timeline, "last_result": last_result,
+        "advance_note": advance_note, "draft_answer": draft_answer,
+    }
+    _load_case(hid)
+    _append_entry("session", "●", "Case resumed", "Restored from the saved checkpoint.")
+    return None
+
+
+def _live_case(hid):
+    """Park the current view and ensure hid is live. Returns an error or None."""
+    _park_active()
+    parked = STATE["cases"].get(hid)
+    if parked is not None and parked["loop"] is not None:
+        _load_case(hid)
+        return None
+    return _restore_case(hid)
+
+
+def _restore_previous_or_clear(previous):
+    if previous is not None and previous in STATE["cases"]:
+        _load_case(previous)
+    else:
+        STATE["loop"] = None
+        STATE["last_result"] = None
+
+
 def current_context():
     loop = STATE["loop"]
-    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"], "provider_label": STATE["provider_label"], "advance_note": STATE["advance_note"], "timeline": STATE["timeline"], "draft_problem": STATE["draft_problem"], "draft_answer": STATE["draft_answer"], "sessions": get_store().list_sessions(), "viewing": None, "recents": _recent_entries()}
+    hid = STATE["history_session_id"]
+    row = get_store().get_session(hid) if hid is not None else None
+    return {"session": loop.session.snapshot if loop else None, "result": STATE["last_result"], "error": STATE["error"], "provider_label": STATE["provider_label"], "advance_note": STATE["advance_note"], "timeline": STATE["timeline"], "draft_problem": STATE["draft_problem"], "draft_answer": STATE["draft_answer"], "sessions": get_store().list_sessions(), "viewing": None, "recents": _recent_entries(), "active_id": hid, "case_status": row["case_status"] if row else None, "solved_note": row["solved_note"] if row else ""}
 
 
 @app.get("/")
@@ -366,7 +583,8 @@ def _outcome_error(result):
     """Browser-safe message for terminal loop outcomes; None when on track."""
     if result is None:
         return None
-    if result.outcome in (LoopOutcome.NEEDS_INPUT, LoopOutcome.COMPLETED):
+    if result.outcome in (LoopOutcome.NEEDS_INPUT, LoopOutcome.COMPLETED,
+                          LoopOutcome.INCONCLUSIVE):
         return None
     if result.outcome is LoopOutcome.PAUSED:
         return f"Diagnosis paused ({result.session.pause_reason}). Start a new investigation to continue."
@@ -384,7 +602,10 @@ def start():
     if not problem:
         STATE["error"] = "Describe the device problem first."
         return redirect(url_for("index"))
+    previous = STATE["history_session_id"]
+    created = None
     try:
+        _park_active()
         image_data_url = image_to_data_url(request.files.get("image"))
         session = DiagnosticSession(problem, max_turns=30, max_completion_attempts=3)
         initial = session.execute("record_evidence", {"source": "user_text", "statement": problem, "provenance": {"channel": "phone_ui", "kind": "initial_problem"}})
@@ -398,13 +619,12 @@ def start():
         STATE["advance_note"] = None
         STATE["timeline"] = []
         STATE["draft_problem"] = ""
-        previous = STATE["history_session_id"]
-        if previous is not None:
-            get_store().archive_session(previous)
         hid = loop.session.snapshot.id
         count = len(get_store().list_sessions()) + 1
         get_store().create_session(hid, f"Investigation {count} — {problem[:36]}", problem)
+        created = hid
         STATE["history_session_id"] = hid
+        STATE["active_id"] = hid
         STATE["provider"] = provider
         STATE["provider_label"] = label
         STATE["images"] = {initial.record_id: image_data_url} if image_data_url else {}
@@ -413,14 +633,20 @@ def start():
         _record_timeline(None, loop.session.snapshot)
         if image_data_url:
             _record_photo_event(initial.record_id)
+        _park_active()
+        _save_case_checkpoint(hid)
+        _sync_case_status(hid, STATE["last_result"])
     except (ValueError, Rejected, ProviderError) as exc:
+        if created is not None:
+            get_store().delete_session(created)
+            created = None
+        _restore_previous_or_clear(previous)
         _record_error(exc)
         STATE["draft_problem"] = problem
-        STATE["loop"] = None
-        STATE["last_result"] = None
     except Exception:  # noqa: BLE001 - demo surface reports failures inline
-        STATE["loop"] = None
-        STATE["last_result"] = None
+        if created is not None:
+            get_store().delete_session(created)
+        _restore_previous_or_clear(previous)
         STATE["draft_problem"] = problem
         STATE["error"] = "Unexpected failure starting the session. Please try again."
     return redirect(url_for("index"))
@@ -431,6 +657,12 @@ def resume():
     STATE["error"] = None
     loop = STATE["loop"]
     if loop is None:
+        return redirect(url_for("index"))
+    if request.form.get("case_id") != STATE["history_session_id"]:
+        STATE["error"] = "That submission belongs to a different case; nothing was changed."
+        return redirect(url_for("index"))
+    if _case_is_solved(STATE["history_session_id"]):
+        STATE["error"] = "That case is solved; reopen it to continue."
         return redirect(url_for("index"))
     answer = (request.form.get("answer") or "").strip()
     if not answer:
@@ -456,6 +688,10 @@ def resume():
         _record_timeline(before, loop.session.snapshot, user_text=answer)
         if image_data_url:
             _record_photo_event(ingested.record_id)
+        hid = STATE["history_session_id"]
+        _park_active()
+        _save_case_checkpoint(hid)
+        _sync_case_status(hid, STATE["last_result"])
     except (ValueError, Rejected, ProviderError) as exc:
         _record_error(exc)
         STATE["draft_answer"] = answer
@@ -472,6 +708,12 @@ def retry():
     loop = STATE["loop"]
     if loop is None:
         return redirect(url_for("index"))
+    if request.form.get("case_id") != STATE["history_session_id"]:
+        STATE["error"] = "That submission belongs to a different case; nothing was changed."
+        return redirect(url_for("index"))
+    if _case_is_solved(STATE["history_session_id"]):
+        STATE["error"] = "That case is solved; reopen it to continue."
+        return redirect(url_for("index"))
     before = loop.session.snapshot
     try:
         # Same loop: feedback and session-wide spend carry over, so a retry
@@ -480,6 +722,10 @@ def retry():
         STATE["error"] = _outcome_error(STATE["last_result"])
         STATE["advance_note"] = None
         _record_timeline(before, loop.session.snapshot)
+        hid = STATE["history_session_id"]
+        _park_active()
+        _save_case_checkpoint(hid)
+        _sync_case_status(hid, STATE["last_result"])
     except (ValueError, Rejected, ProviderError) as exc:
         _record_error(exc)
     except Exception:  # noqa: BLE001 - demo surface reports failures inline
@@ -491,20 +737,97 @@ def retry():
 
 @app.post("/reset")
 def reset():
-    hid = STATE["history_session_id"]
-    if hid is not None:
-        get_store().archive_session(hid)
-    STATE["loop"] = None
-    STATE["last_result"] = None
+    _park_active()
+    _clear_flats()
+    return redirect(url_for("index"))
+
+
+@app.post("/case/<hid>/switch")
+def switch_case(hid):
     STATE["error"] = None
-    STATE["provider"] = None
-    STATE["provider_label"] = None
-    STATE["images"] = {}
-    STATE["advance_note"] = None
-    STATE["timeline"] = []
-    STATE["draft_problem"] = ""
-    STATE["draft_answer"] = ""
-    STATE["history_session_id"] = None
+    if hid == STATE["history_session_id"] and STATE["loop"] is not None:
+        return redirect(url_for("index"))
+    previous = STATE["history_session_id"]
+    failure = _live_case(hid)
+    if failure is not None:
+        _restore_previous_or_clear(previous)
+        STATE["error"] = failure
+        return redirect(url_for("view_history", session_id=hid))
+    return redirect(url_for("index"))
+
+
+@app.post("/case/<hid>/solve")
+def solve_case(hid):
+    STATE["error"] = None
+    row = get_store().get_session(hid)
+    if row is None or row["archived"]:
+        STATE["error"] = "Investigation not found."
+        return redirect(url_for("index"))
+    if row["case_status"] == "solved":
+        return redirect(url_for("index"))
+    previous = STATE["history_session_id"]
+    if hid != previous or STATE["loop"] is None:
+        failure = _live_case(hid)
+        if failure is not None:
+            _restore_previous_or_clear(previous)
+            STATE["error"] = failure
+            return redirect(url_for("view_history", session_id=hid))
+    note = (request.form.get("note") or "").strip()
+    get_store().set_case_status(hid, "solved", note)
+    _append_entry("case", "●", "Marked solved",
+                  note or "Technician marked this case solved.")
+    _park_active()
+    _save_case_checkpoint(hid)
+    return redirect(url_for("index"))
+
+
+@app.post("/case/<hid>/reopen")
+def reopen_case(hid):
+    STATE["error"] = None
+    row = get_store().get_session(hid)
+    if row is None or row["archived"]:
+        STATE["error"] = "Investigation not found."
+        return redirect(url_for("index"))
+    previous = STATE["history_session_id"]
+    if hid != previous or STATE["loop"] is None:
+        failure = _live_case(hid)
+        if failure is not None:
+            _restore_previous_or_clear(previous)
+            STATE["error"] = failure
+            return redirect(url_for("view_history", session_id=hid))
+    note = (request.form.get("note") or "").strip() or "Technician reopened the case."
+    loop = STATE["loop"]
+    try:
+        before = loop.session.snapshot
+        if before.status in (S.COMPLETED, S.INCONCLUSIVE):
+            loop.session.execute("reopen_investigation", {"reason": note})
+            _append_entry("case", "○", "Case reopened", note)
+            get_store().set_case_status(hid, "open")
+            _park_active()
+            _save_case_checkpoint(hid)
+            mid = loop.session.snapshot
+            try:
+                STATE["last_result"] = loop.run()
+            except Exception as exc:  # noqa: BLE001 - reopen already persisted
+                print(f"[phone_app] reopen run failed for {hid}: {exc}", flush=True)
+                STATE["last_result"] = None
+                STATE["error"] = (
+                    "The case was reopened, but continuing failed. Please try again.")
+                _park_active()
+                _save_case_checkpoint(hid)
+                return redirect(url_for("index"))
+            STATE["error"] = _outcome_error(STATE["last_result"])
+            _record_timeline(mid, loop.session.snapshot)
+        else:
+            _append_entry("case", "○", "Case reopened", note)
+        get_store().set_case_status(hid, "open")
+        _sync_case_status(hid, STATE["last_result"])
+        _park_active()
+        _save_case_checkpoint(hid)
+    except (ValueError, Rejected, ProviderError) as exc:
+        _record_error(exc)
+    except Exception:  # noqa: BLE001 - demo surface reports failures inline
+        STATE["error"] = "Unexpected failure while reopening. Please try again."
     return redirect(url_for("index"))
 
 
@@ -517,6 +840,11 @@ def view_history(session_id):
     context = current_context()
     context["viewing"] = {
         "session": session, "events": get_store().get_events(session_id)}
+    try:
+        checkpoint = get_store().load_checkpoint(session_id)
+    except ValueError:
+        checkpoint = "corrupt"
+    context["can_resume"] = not session["archived"] and checkpoint not in (None, "corrupt")
     return render_template_string(PAGE, **context)
 
 

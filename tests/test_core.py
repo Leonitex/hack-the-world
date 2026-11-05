@@ -65,9 +65,10 @@ class CoreTests(unittest.TestCase):
     def test_model_action_enumeration_excludes_trusted_ingestion(self):
         self.assertEqual(set(MODEL_ACTION_FIELDS), {
             "propose_hypothesis", "update_hypothesis", "request_diagnostic_test",
-            "request_user_evidence", "submit_recommendation",
+            "request_user_evidence", "submit_recommendation", "declare_inconclusive",
         })
-        for action in ("record_evidence", "record_test_result", "provide_user_evidence"):
+        for action in ("record_evidence", "record_test_result", "provide_user_evidence",
+                       "reopen_investigation"):
             with self.subTest(action=action):
                 self.assertNotIn(action, MODEL_ACTION_FIELDS)
 
@@ -85,6 +86,7 @@ class CoreTests(unittest.TestCase):
     def test_trusted_ingestion_actions_remain_valid_through_application_api(self):
         self.assertEqual(set(TRUSTED_INGESTION_ACTION_FIELDS), {
             "record_evidence", "record_test_result", "provide_user_evidence",
+            "reopen_investigation",
         })
         initial = self.evidence("Initial user observation")
         test_request = self.request("request_diagnostic_test")

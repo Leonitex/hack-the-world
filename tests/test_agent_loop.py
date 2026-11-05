@@ -554,7 +554,12 @@ class AgentLoopTests(unittest.TestCase):
             ToolCall("propose_hypothesis", {"cause": "Cause A"}),
             ToolCall("request_user_evidence", request_args()),
             ToolCall("propose_hypothesis", {"cause": "Cause B"}),
-            ToolCall("request_diagnostic_test", request_args()),
+            # A genuinely different follow-up: the repeat guard blocks the
+            # same question re-asked through the other request kind.
+            ToolCall("request_diagnostic_test", {
+                "action": "Inspect the charging port for debris and report what you find.",
+                "observations": ["Is the port clean?", "Any bent pins?"],
+            }),
         ])
         loop = AgentLoop(core, provider, max_provider_steps=8, max_advance_steps=2)
         first = loop.run()

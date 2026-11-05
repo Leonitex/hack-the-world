@@ -40,6 +40,8 @@ def verify_hypothesis(session, old, new):
     if new.status == H.CONFIRMED and unresolved:
         raise Rejected("Unresolved contradictions prevent confirmation")
     if old.status == H.ELIMINATED and new.status == H.SUPPORTED:
+        if old.eliminated_at is None:
+            raise Rejected("Elimination mark is missing")
         later = {e.id for e in session.evidence if e.order > old.eliminated_at}
         if not (set(new.supporting) - set(old.supporting)) & later:
             raise Rejected("Reopening requires new support recorded after elimination")
@@ -58,3 +60,10 @@ def verify_recommendation(session, candidate):
     if set(candidate.acknowledged_contradictions) != unresolved:
         raise Rejected("Recommendation must surface all unresolved contradictions")
     return ()
+
+
+def verify_inconclusive(session, report):
+    """An inconclusive handoff must cite real checked evidence, never invent it."""
+    if not report.checked_evidence_ids:
+        raise Rejected("An inconclusive report must cite checked evidence")
+    verify_references(session, report.checked_evidence_ids)

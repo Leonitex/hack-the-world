@@ -9,6 +9,7 @@ class SessionStatus(StrEnum):
     NEEDS_INPUT = "needs_input"
     AWAITING_VERIFICATION = "awaiting_verification"
     COMPLETED = "completed"
+    INCONCLUSIVE = "inconclusive"
     PAUSED = "paused"
 
 
@@ -68,6 +69,20 @@ class Verification:
 
 
 @dataclass(frozen=True)
+class InconclusiveReport:
+    """Honest terminal handoff: what was checked, what remains, what is safe.
+
+    Never a verified root cause. checked_evidence_ids must reference real
+    session evidence; verification rejects invented citations.
+    """
+
+    summary: str
+    checked_evidence_ids: tuple[str, ...]
+    remaining_possibilities: str
+    safe_next_steps: str
+
+
+@dataclass(frozen=True)
 class Session:
     id: str
     problem: str
@@ -79,6 +94,7 @@ class Session:
     next_action: InputRequest | None = None
     recommendation: Recommendation | None = None
     verifications: tuple[Verification, ...] = ()
+    inconclusive: InconclusiveReport | None = None
     pause_reason: str | None = None
 
 

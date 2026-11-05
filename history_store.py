@@ -4,13 +4,16 @@ Every investigation gets a session row; every user-visible timeline entry
 becomes an event row with a per-session sequence number and a UTC
 timestamp. Connections are short-lived and each write commits atomically,
 so a crash can lose at most the in-flight row. Sessions left live by an
-older process are swept to read-only archived status on startup: history
-survives restarts, but a dead live session is never presented as
-resumable. Uploaded photo bytes are never stored here.
+older process without a checkpoint are swept to read-only archived status
+on startup: history survives restarts, but a dead unrestorable session is
+never presented as resumable. Checkpointed sessions stay open and restore
+lazily through validated core/loop contracts. Uploaded photo bytes and
+provider credentials are never stored here.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import uuid
@@ -26,7 +29,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     run_token TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    archived INTEGER NOT NULL DEFAULT 0
+    archived INTEGER NOT NULL DEFAULT 0,
+    case_status TEXT NOT NULL DEFAULT 'open',
+    solved_note TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,7 +46,17 @@ CREATE TABLE IF NOT EXISTS events (
     UNIQUE (session_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, seq);
+CREATE TABLE IF NOT EXISTS checkpoints (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+    version INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
+
+SCHEMA_VERSION = 2
+
+CASE_STATUSES = ("open", "awaiting", "inconclusive", "solved")
 
 MAX_NAME_LENGTH = 80
 
@@ -59,11 +74,35 @@ class HistoryStore:
         self._run_token = uuid.uuid4().hex
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.execute(
                 "UPDATE sessions SET archived = 1, status = 'archived', updated_at = ?"
-                " WHERE archived = 0 AND run_token != ?",
+                " WHERE archived = 0 AND run_token != ?"
+                " AND id NOT IN (SELECT session_id FROM checkpoints)",
                 (_now(), self._run_token),
             )
+
+    @staticmethod
+    def _migrate(conn):
+        # Column presence decides, not the version flag alone: a hand-built
+        # database could claim a newer version while missing the columns.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if "case_status" not in columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN case_status TEXT NOT NULL DEFAULT 'open'")
+        if "solved_note" not in columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN solved_note TEXT NOT NULL DEFAULT ''")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def delete_session(self, session_id):
+        """Remove a session row with its events and checkpoint, if any."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM events WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM checkpoints WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
 
     @property
     def path(self):
@@ -93,11 +132,50 @@ class HistoryStore:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO sessions (id, name, problem, status, run_token,"
-                " created_at, updated_at, archived)"
-                " VALUES (?, ?, ?, 'live', ?, ?, ?, 0)",
+                " created_at, updated_at, archived, case_status, solved_note)"
+                " VALUES (?, ?, ?, 'live', ?, ?, ?, 0, 'open', '')",
                 (session_id, name, problem, self._run_token, now, now),
             )
         return session_id
+
+    def set_case_status(self, session_id, status, note=""):
+        if status not in CASE_STATUSES:
+            raise ValueError(f"Unknown case status: {status}")
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET case_status = ?, solved_note = ?, updated_at = ?"
+                " WHERE id = ?",
+                (status, note or "", _now(), session_id),
+            )
+
+    def adopt_session(self, session_id):
+        """Mark a restored session owned by this process after validation."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET run_token = ?, updated_at = ? WHERE id = ?",
+                (self._run_token, _now(), session_id),
+            )
+
+    def save_checkpoint(self, session_id, bundle):
+        version = bundle.get("version") if isinstance(bundle, dict) else None
+        if type(version) is not int:
+            raise ValueError("Checkpoint bundle must carry an integer version")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO checkpoints (session_id, version, payload, updated_at)"
+                " VALUES (?, ?, ?, ?)",
+                (session_id, version, json.dumps(bundle), _now()),
+            )
+
+    def load_checkpoint(self, session_id):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM checkpoints WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
 
     def archive_session(self, session_id):
         with self._connect() as conn:
