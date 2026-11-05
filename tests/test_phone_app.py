@@ -33,11 +33,19 @@ def propose_cause(cause="Cause A"):
     return ToolCall("propose_hypothesis", {"cause": cause})
 
 
-def request_evidence():
+def request_evidence(action=None, observations=None):
     return ToolCall("request_user_evidence", {
-        "action": "Check the indicator light and report what you see.",
-        "observations": ["What color is the light?", "Is it steady or blinking?"],
+        "action": action or "Check the indicator light and report what you see.",
+        "observations": observations or ["What color is the light?", "Is it steady or blinking?"],
     })
+
+
+def followup_evidence():
+    """A genuinely different follow-up check for post-resume stages."""
+    return request_evidence(
+        "Listen for fan noise and report what you hear.",
+        ["Do you hear the fan?"],
+    )
 
 
 class PhoneAppTests(unittest.TestCase):
@@ -226,14 +234,17 @@ class PhoneAppTests(unittest.TestCase):
 
     def test_resume_continues_after_start_consumes_advance(self):
         # Issue #6 repro: the start phase may spend its whole advance, but
-        # Submit & continue must still reach a new actionable step.
-        script = [propose_cause(f"Cause {index}") for index in range(13)]
+        # Submit & continue must still reach a new actionable step. Seven
+        # proposes plus six malformed retries still spend the 14-step advance
+        # without tripping the no-progress honest close.
+        script = [propose_cause(f"Cause {index}") for index in range(7)]
+        script.extend(["garbage"] * 6)
         script.append(request_evidence())
         response, fake = self.start_session(script=script)
         self.assertIn("Do this next", response.get_data(as_text=True))
         self.assertEqual(phone_app.STATE["last_result"].outcome, LoopOutcome.NEEDS_INPUT)
         calls_before = fake.decide_calls
-        fake.stage(propose_cause("Cause after resume"), request_evidence())
+        fake.stage(propose_cause("Cause after resume"), followup_evidence())
         response = self.client.post(
             "/resume", data={"answer": "The indicator light is steady green."},
             follow_redirects=True,
@@ -245,8 +256,16 @@ class PhoneAppTests(unittest.TestCase):
 
     def test_second_and_third_user_turns_keep_progressing(self):
         _, fake = self.start_session(script=[propose_cause(), request_evidence()])
-        for turn in ("First observation recorded.", "Second observation recorded."):
-            fake.stage(propose_cause(f"Cause for {turn}"), request_evidence())
+        follow_ups = [
+            ("Listen for fan noise and report what you hear.", ["Do you hear the fan?"]),
+            ("Inspect the charging port for debris.", ["Is the port clean?"]),
+        ]
+        turns = ("First observation recorded.", "Second observation recorded.")
+        for turn, (action, observations) in zip(turns, follow_ups):
+            fake.stage(
+                propose_cause(f"Cause for {turn}"),
+                request_evidence(action, observations),
+            )
             response = self.client.post(
                 "/resume", data={"answer": turn}, follow_redirects=True)
             self.assertIn("Do this next", response.get_data(as_text=True))
@@ -259,7 +278,7 @@ class PhoneAppTests(unittest.TestCase):
 
     def test_resume_shows_reassessment_note(self):
         _, fake = self.start_session(script=[propose_cause(), request_evidence()])
-        fake.stage(propose_cause("Cause B"), request_evidence())
+        fake.stage(propose_cause("Cause B"), followup_evidence())
         response = self.client.post(
             "/resume", data={"answer": "The light is steady green."},
             follow_redirects=True,
@@ -296,7 +315,7 @@ class PhoneAppTests(unittest.TestCase):
         self.assertEqual(titles[0], "Session started")
         self.assertTrue(titles[1].startswith("New cause considered ("))
         self.assertEqual(titles[2], "Test requested")
-        fake.stage(propose_cause("Cause B"), request_evidence())
+        fake.stage(propose_cause("Cause B"), followup_evidence())
         response = self.client.post(
             "/resume", data={"answer": "The light is steady green."},
             follow_redirects=True,
@@ -390,7 +409,7 @@ class PhoneAppTests(unittest.TestCase):
 
     def test_history_parity_no_fabrication(self):
         _, fake = self.start_session(script=[propose_cause(), request_evidence()])
-        fake.stage(propose_cause("Cause B"), request_evidence())
+        fake.stage(propose_cause("Cause B"), followup_evidence())
         self.client.post("/resume", data={"answer": "The light is steady green."},
                          follow_redirects=True)
         memory = [(e["kind"], e["title"], e["detail"]) for e in phone_app.STATE["timeline"]]

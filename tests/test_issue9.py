@@ -13,6 +13,8 @@ import sqlite3
 import tempfile
 import unittest
 
+from agent.loop import AgentLoop, LoopOutcome
+from agent.providers import CompletedStep, FakeProvider, ToolCall
 from diagnostic_core.contracts import MODEL_ACTION_FIELDS
 from diagnostic_core.engine import DiagnosticSession
 from diagnostic_core.models import Rejected, SessionStatus as S
@@ -276,6 +278,311 @@ class CheckpointTests(unittest.TestCase):
             "provenance": {"channel": "t", "kind": "k"},
         })
         self.assertIs(result.session.status, S.INVESTIGATING)
+
+
+def _loop(problem=PROBLEM, script=(), **kwargs):
+    session = DiagnosticSession(problem)
+    session.execute("record_evidence", {
+        "source": "user_text", "statement": problem,
+        "provenance": {"channel": "test", "kind": "initial_problem"},
+    })
+    provider = FakeProvider(list(script))
+    return AgentLoop(session, provider, **kwargs), provider
+
+
+def _request_call(action, observations=("What happened?",)):
+    return ToolCall("request_diagnostic_test", {
+        "action": action, "observations": list(observations),
+    })
+
+
+POWER_TEST = "Press and hold the power button for ten seconds."
+CHARGER_TEST = "Try a known-good charger in a different wall outlet."
+
+
+class TrajectoryTests(unittest.TestCase):
+    """M8A: the loop captures authoritative request/result pairs."""
+
+    def test_completed_pair_reaches_next_provider_request(self):
+        loop, provider = _loop(script=[
+            _request_call(POWER_TEST),
+            ToolCall("propose_hypothesis", {"cause": "Dead battery."}),
+        ])
+        first = loop.run()
+        self.assertIs(first.outcome, LoopOutcome.NEEDS_INPUT)
+        request_id = first.session.next_action.id
+        ingested = loop.resume_with_result(
+            "Nothing happened. No LED, no fan.",
+            {"channel": "test", "kind": "observation"},
+        )
+        loop.run()
+        trajectory = provider.requests[-1].trajectory
+        self.assertEqual(len(trajectory), 1)
+        step = trajectory[0]
+        self.assertIsInstance(step, CompletedStep)
+        self.assertEqual(step.request_id, request_id)
+        self.assertEqual(step.kind, "request_diagnostic_test")
+        self.assertEqual(step.action, POWER_TEST)
+        self.assertEqual(step.evidence_id, ingested.record_id)
+        self.assertIn("No LED", step.statement)
+
+    def test_trajectory_survives_feedback_window(self):
+        script = [_request_call(f"Diagnostic test number {index}.")
+                for index in range(12)]
+        loop, provider = _loop(script=script)
+        for index in range(12):
+            result = loop.run()
+            self.assertIs(result.outcome, LoopOutcome.NEEDS_INPUT)
+            loop.resume_with_result(
+                f"Result number {index}.",
+                {"channel": "test", "kind": "observation"},
+            )
+        loop.run()
+        trajectory = provider.requests[-1].trajectory
+        self.assertEqual(len(trajectory), 12)
+        self.assertEqual(trajectory[0].action, "Diagnostic test number 0.")
+        self.assertEqual(trajectory[-1].statement, "Result number 11.")
+
+
+class DuplicateGuardTests(unittest.TestCase):
+    """M8B: answered tests are never presented to the user twice."""
+
+    def test_exact_repeat_blocked_before_core(self):
+        loop, provider = _loop(script=[
+            _request_call(POWER_TEST),
+            _request_call(POWER_TEST),
+            _request_call(CHARGER_TEST),
+        ])
+        first = loop.run()
+        self.assertIs(first.outcome, LoopOutcome.NEEDS_INPUT)
+        turns_before = first.session.turn_count
+        loop.resume_with_result("Nothing happened.",
+                                {"channel": "test", "kind": "observation"})
+        turns_after_resume = loop.session.snapshot.turn_count
+        second = loop.run()
+        self.assertIs(second.outcome, LoopOutcome.NEEDS_INPUT)
+        # The duplicate consumed no core turn; the distinct test did.
+        self.assertEqual(loop.session.snapshot.turn_count, turns_after_resume + 1)
+        self.assertGreater(turns_after_resume, turns_before)
+        self.assertEqual(second.session.next_action.action, CHARGER_TEST)
+        feedback = provider.requests[-1].feedback[-1]
+        self.assertIn("already", feedback.message.lower())
+
+    def test_near_duplicate_synonym_blocked(self):
+        loop, _provider = _loop(script=[
+            _request_call(POWER_TEST),
+            _request_call("Press and hold the power button for 10 seconds!!"),
+            _request_call(CHARGER_TEST),
+        ])
+        loop.run()
+        loop.resume_with_result("Nothing happened.",
+                                {"channel": "test", "kind": "observation"})
+        second = loop.run()
+        self.assertIs(second.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertEqual(second.session.next_action.action, CHARGER_TEST)
+
+    def test_genuinely_distinct_test_allowed(self):
+        loop, _provider = _loop(script=[
+            _request_call("Check the power cable connection."),
+            _request_call("Check the power button connection."),
+        ])
+        loop.run()
+        loop.resume_with_result("Cable is firmly connected.",
+                                {"channel": "test", "kind": "observation"})
+        second = loop.run()
+        self.assertIs(second.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertEqual(
+            second.session.next_action.action, "Check the power button connection.")
+
+    def test_grounded_retest_with_new_condition_allowed(self):
+        loop, _provider = _loop(script=[
+            _request_call(POWER_TEST),
+            _request_call(
+                "Press and hold the power button for ten seconds while "
+                "the known-good charger is connected.",
+                observations=("Does any LED blink now?",)),
+        ])
+        loop.run()
+        loop.resume_with_result("Nothing happened.",
+                                {"channel": "test", "kind": "observation"})
+        second = loop.run()
+        self.assertIs(second.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertIn("known-good charger", second.session.next_action.action)
+
+    def test_duplicate_count_resets_after_genuine_progress(self):
+        loop, _provider = _loop(script=[
+            _request_call(POWER_TEST),
+            _request_call(POWER_TEST),
+            _request_call(POWER_TEST),
+            _request_call(CHARGER_TEST),
+            _request_call(POWER_TEST),
+            _request_call(POWER_TEST),
+            _request_call("Inspect the charging port for debris."),
+        ])
+        loop.run()
+        loop.resume_with_result("Nothing happened.",
+                                {"channel": "test", "kind": "observation"})
+        # Two duplicates rejected, then a distinct test proceeds: no
+        # auto-inconclusive yet, and the later duplicates start fresh.
+        mid = loop.run()
+        self.assertIs(mid.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertEqual(mid.session.next_action.action, CHARGER_TEST)
+        loop.resume_with_result("Still nothing.",
+                                {"channel": "test", "kind": "observation"})
+        final = loop.run()
+        self.assertIs(final.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertIn("debris", final.session.next_action.action)
+
+
+class AutoInconclusiveTests(unittest.TestCase):
+    """M8B/M8C: persistent no-progress ends honestly, never loops."""
+
+    def test_three_repeats_end_inconclusive_with_checked_evidence(self):
+        loop, provider = _loop(script=[
+            _request_call(POWER_TEST),
+            _request_call(POWER_TEST),
+            _request_call(POWER_TEST),
+            _request_call(POWER_TEST),
+        ])
+        loop.run()
+        loop.resume_with_result("Nothing happened. No LED, no fan.",
+                                {"channel": "test", "kind": "observation"})
+        turns_after_resume = loop.session.snapshot.turn_count
+        result = loop.run()
+        self.assertIs(result.outcome, LoopOutcome.INCONCLUSIVE)
+        self.assertIs(result.session.status, S.INCONCLUSIVE)
+        report = result.session.inconclusive
+        self.assertIsNotNone(report)
+        known = {item.id for item in result.session.evidence}
+        self.assertTrue(set(report.checked_evidence_ids) <= known)
+        self.assertTrue(report.checked_evidence_ids)
+        self.assertIsNone(result.session.recommendation)
+        # Duplicates burned no diagnostic turns; only the honest close did.
+        self.assertEqual(loop.session.snapshot.turn_count, turns_after_resume + 1)
+        self.assertEqual(provider.decide_calls, 4)
+
+    def test_stale_hypothesis_churn_ends_inconclusive(self):
+        script = [ToolCall("propose_hypothesis", {"cause": f"Cause {index}."})
+                  for index in range(8)]
+        loop, _provider = _loop(script=script)
+        result = loop.run()
+        self.assertIs(result.outcome, LoopOutcome.INCONCLUSIVE)
+        self.assertIsNotNone(result.session.inconclusive)
+        self.assertIsNone(result.session.recommendation)
+        self.assertEqual(result.session.turn_count, 10)
+
+    def test_model_declared_inconclusive_stops_immediately(self):
+        session = DiagnosticSession(PROBLEM)
+        session.execute("record_evidence", {
+            "source": "user_text", "statement": PROBLEM,
+            "provenance": {"channel": "test", "kind": "initial_problem"},
+        })
+        evidence_id = session.snapshot.evidence[0].id
+        provider = FakeProvider([
+            ToolCall("propose_hypothesis", {"cause": "Dead battery."}),
+            ToolCall("declare_inconclusive", {
+                "summary": "No safe test can narrow this further.",
+                "checked_evidence_ids": [evidence_id],
+                "remaining_possibilities": "Board or battery failure.",
+                "safe_next_steps": "Take the phone to a repair shop.",
+            }),
+        ])
+        loop = AgentLoop(session, provider)
+        result = loop.run()
+        self.assertIs(result.outcome, LoopOutcome.INCONCLUSIVE)
+        self.assertEqual(provider.decide_calls, 2)
+        again = loop.run()
+        self.assertIs(again.outcome, LoopOutcome.INCONCLUSIVE)
+        self.assertEqual(provider.decide_calls, 2)
+
+    def test_m8d_acceptance_scenario(self):
+        """Power press -> nothing; charger check -> nothing; repeat power
+        press must replan or end inconclusive, never re-ask or confirm."""
+        loop, provider = _loop(script=[
+            _request_call(POWER_TEST),
+            _request_call(CHARGER_TEST),
+            _request_call(POWER_TEST),
+            _request_call("press + hold the POWER button for ten seconds"),
+            _request_call(POWER_TEST),
+        ])
+        loop.run()
+        loop.resume_with_result("No LED, no fan, nothing at all.",
+                                {"channel": "test", "kind": "observation"})
+        loop.run()
+        loop.resume_with_result("Still no change with the other charger.",
+                                {"channel": "test", "kind": "observation"})
+        result = loop.run()
+        self.assertIs(result.outcome, LoopOutcome.INCONCLUSIVE)
+        session = result.session
+        self.assertIsNone(session.recommendation)
+        self.assertFalse([
+            h for h in session.hypotheses if str(h.status) == "confirmed"])
+        # Exactly two real requests were ever created; the three repeats
+        # burned no turns. Only the honest close added a final turn.
+        self.assertEqual(session.turn_count, 6)
+        seen = provider.requests[-1].trajectory
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(len({step.request_id for step in seen}), 2)
+
+    def test_reopen_attempt_by_model_is_structurally_blocked(self):
+        loop, provider = _loop(script=[
+            ToolCall("reopen_investigation", {"reason": "Model tried."}),
+        ])
+        before = loop.session.snapshot.turn_count
+        result = loop.run()
+        self.assertEqual(result.outcome, LoopOutcome.PROVIDER_ERROR)
+        self.assertEqual(loop.session.snapshot.turn_count, before)
+        structural = provider.requests[1].feedback[0].message
+        self.assertIn("never model-callable", structural)
+
+
+class BookkeepingTests(unittest.TestCase):
+    """M8E: loop bookkeeping restores budgets and anti-repeat state."""
+
+    def test_bookkeeping_round_trip_blocks_repeats_after_restore(self):
+        loop, _provider = _loop(
+            script=[_request_call(POWER_TEST)], max_provider_steps=60,
+            max_advance_steps=14)
+        loop.run()
+        loop.resume_with_result("Nothing happened.",
+                                {"channel": "test", "kind": "observation"})
+        saved = loop.capture_bookkeeping()
+        json.dumps(saved)
+        restored_session = DiagnosticSession.from_checkpoint(
+            loop.session.to_checkpoint())
+        fresh = FakeProvider([_request_call(POWER_TEST), _request_call(CHARGER_TEST)])
+        revived = AgentLoop(restored_session, fresh)
+        revived.apply_bookkeeping(saved)
+        self.assertEqual(revived.steps_used, loop.steps_used)
+        result = revived.run()
+        self.assertIs(result.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertEqual(result.session.next_action.action, CHARGER_TEST)
+
+    def test_bookkeeping_rejects_budget_reset(self):
+        loop, _provider = _loop(script=[_request_call(POWER_TEST)])
+        loop.run()
+        loop.resume_with_result("Nothing happened.",
+                                {"channel": "test", "kind": "observation"})
+        saved = loop.capture_bookkeeping()
+        self.assertEqual(len(saved["trajectory"]), 1)
+        # Billed steps can never drop below the turns actually performed.
+        tampered = dict(saved)
+        tampered["steps_used"] = 0
+        revived = AgentLoop(loop.session, FakeProvider([]))
+        with self.assertRaises(Rejected):
+            revived.apply_bookkeeping(tampered)
+        # ... nor exceed the restored session cap.
+        tampered = dict(saved)
+        tampered["steps_used"] = tampered["max_provider_steps"] + 1
+        with self.assertRaises(Rejected):
+            revived.apply_bookkeeping(tampered)
+
+    def test_bookkeeping_rejects_unknown_version(self):
+        loop, _provider = _loop(script=[])
+        saved = loop.capture_bookkeeping()
+        saved["version"] = 999
+        with self.assertRaises(Rejected):
+            loop.apply_bookkeeping(saved)
 
 
 if __name__ == "__main__":

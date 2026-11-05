@@ -21,23 +21,36 @@ bounded allowance on the next run() while billed work stays capped
 session-wide. Spending one advance mid-investigation returns
 ADVANCE_EXHAUSTED, which an explicit same-loop retry may continue;
 spending the session cap returns BUDGET_EXHAUSTED.
+
+The loop also owns the authoritative trajectory: every core-generated
+request linked to the evidence ingested for it. A request repeating an
+answered test (exact or near-identical wording) is rejected as
+no-progress before reaching the core, and persistent no-progress closes
+honestly as inconclusive instead of looping forever.
 """
 
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
 
-from diagnostic_core.contracts import MODEL_ACTION_FIELDS, validate_arguments
+from diagnostic_core.contracts import MODEL_ACTION_FIELDS, is_text, validate_arguments
 from diagnostic_core.engine import DiagnosticSession
-from diagnostic_core.models import ActionResult, Rejected, Session, SessionStatus as S
+from diagnostic_core.models import (
+    ActionResult, HypothesisStatus as H, Rejected, Session, SessionStatus as S,
+)
 
-from .providers import ProviderDecision, ProviderError, ProviderRequest, StepFeedback, ToolCall
+from .providers import (
+    CompletedStep, ProviderDecision, ProviderError, ProviderRequest,
+    StepFeedback, ToolCall,
+)
 from .tools import MODEL_TOOLS, StructuralError, validate_tool_call
 
 
 class LoopOutcome(StrEnum):
     COMPLETED = "completed"
     NEEDS_INPUT = "needs_input"
+    INCONCLUSIVE = "inconclusive"
     PAUSED = "paused"
     PROVIDER_ERROR = "provider_error"
     BUDGET_EXHAUSTED = "budget_exhausted"
@@ -58,6 +71,11 @@ class AgentLoop:
 
     DEFAULT_MAX_PROVIDER_STEPS = 50
     FEEDBACK_WINDOW = 10
+    # Consecutive answered-test repeats before the loop closes honestly.
+    MAX_CONSECUTIVE_DUPLICATES = 3
+    # Consecutive steps without new evidence or verification before ditto.
+    MAX_STALE_STEPS = 8
+    BOOKKEEPING_VERSION = 1
 
     def __init__(self, session, provider, *, max_provider_steps=DEFAULT_MAX_PROVIDER_STEPS,
                  max_advance_steps=None):
@@ -76,6 +94,9 @@ class AgentLoop:
         self._max_provider_steps = max_provider_steps
         self._max_advance_steps = max_advance_steps
         self._feedback = []
+        self._trajectory = []
+        self._duplicates = 0
+        self._stale = 0
         self._steps_used = 0
         self._run_entry_steps = 0
 
@@ -96,11 +117,18 @@ class AgentLoop:
             snapshot = self._session.snapshot
             if snapshot.status is S.COMPLETED:
                 return self._result(LoopOutcome.COMPLETED, snapshot, "Recommendation verified; session completed.")
+            if snapshot.status is S.INCONCLUSIVE:
+                self._reset_progress()
+                return self._result(
+                    LoopOutcome.INCONCLUSIVE, snapshot,
+                    f"Inconclusive: {_report_summary(snapshot)}",
+                )
             if snapshot.status is S.PAUSED:
                 return self._result(
                     LoopOutcome.PAUSED, snapshot, f"Session paused: {snapshot.pause_reason}.",
                 )
             if snapshot.status is S.NEEDS_INPUT:
+                self._reset_progress()
                 return self._result(
                     LoopOutcome.NEEDS_INPUT, snapshot,
                     "Waiting on a trusted result for the pending request.",
@@ -146,19 +174,43 @@ class AgentLoop:
             except StructuralError as exc:
                 self._record_feedback(tool=None, ok=False, message=str(exc))
                 continue
+            if name in ("request_diagnostic_test", "request_user_evidence"):
+                repeat = _find_repeat(
+                    name, arguments, self._trajectory, snapshot.next_action)
+                if repeat is not None:
+                    self._duplicates += 1
+                    self._stale += 1
+                    self._record_feedback(tool=name, ok=False, message=repeat)
+                    if self._duplicates >= self.MAX_CONSECUTIVE_DUPLICATES:
+                        closing = self._try_honest_close("repeat")
+                        if closing is not None:
+                            return closing
+                    continue
             try:
                 result = self._session.execute(name, arguments)
             except Rejected as exc:
                 # A rejection may still exhaust a core limit and pause.
-                snapshot = self._session.snapshot
+                after = self._session.snapshot
                 self._record_feedback(tool=name, ok=False, message=f"{name} rejected: {exc}")
-                if snapshot.status is S.PAUSED:
+                if after.status is S.PAUSED:
                     return self._result(
-                        LoopOutcome.PAUSED, snapshot, f"Session paused: {snapshot.pause_reason}.",
+                        LoopOutcome.PAUSED, after, f"Session paused: {after.pause_reason}.",
                     )
+                if after.completion_attempts != snapshot.completion_attempts:
+                    self._reset_progress()
+                else:
+                    self._stale += 1
+                    if self._stale >= self.MAX_STALE_STEPS:
+                        closing = self._try_honest_close("stale")
+                        if closing is not None:
+                            return closing
                 continue
             snapshot = result.session
             self._record_success(name, result)
+            if name in ("propose_hypothesis", "update_hypothesis"):
+                self._stale += 1
+            else:
+                self._reset_progress()
             if snapshot.status is S.NEEDS_INPUT:
                 return self._result(
                     LoopOutcome.NEEDS_INPUT, snapshot,
@@ -166,10 +218,19 @@ class AgentLoop:
                 )
             if snapshot.status is S.COMPLETED:
                 return self._result(LoopOutcome.COMPLETED, snapshot, "Recommendation verified; session completed.")
+            if snapshot.status is S.INCONCLUSIVE:
+                return self._result(
+                    LoopOutcome.INCONCLUSIVE, snapshot,
+                    f"Inconclusive: {_report_summary(snapshot)}",
+                )
             if snapshot.status is S.PAUSED:
                 return self._result(
                     LoopOutcome.PAUSED, snapshot, f"Session paused: {snapshot.pause_reason}.",
                 )
+            if self._stale >= self.MAX_STALE_STEPS:
+                closing = self._try_honest_close("stale")
+                if closing is not None:
+                    return closing
 
     def resume_with_result(self, statement, provenance, *, source="user_text"):
         """Record a trusted real-world result for the pending request.
@@ -199,7 +260,88 @@ class AgentLoop:
         # diagnostic turn. Session/semantic validity stays authoritative in
         # execute(), which validates again.
         validate_arguments(action, arguments)
-        return self._session.execute(action, arguments)
+        result = self._session.execute(action, arguments)
+        self._trajectory.append(CompletedStep(
+            request_id=pending.id, kind=pending.kind, action=pending.action,
+            observations=tuple(pending.observations),
+            evidence_id=result.record_id, statement=statement,
+        ))
+        self._reset_progress()
+        return result
+
+    def capture_bookkeeping(self):
+        """Export restart-recovery state: billed steps, budgets, trajectory."""
+        return {
+            "version": self.BOOKKEEPING_VERSION,
+            "steps_used": self._steps_used,
+            "max_provider_steps": self._max_provider_steps,
+            "max_advance_steps": self._max_advance_steps,
+            "trajectory": [
+                {
+                    "request_id": step.request_id, "kind": step.kind,
+                    "action": step.action,
+                    "observations": list(step.observations),
+                    "evidence_id": step.evidence_id,
+                    "statement": step.statement,
+                }
+                for step in self._trajectory
+            ],
+        }
+
+    def apply_bookkeeping(self, data):
+        """Restore bookkeeping onto this loop's session. Rejects tampering.
+
+        Billed steps can never fall below the completed requests they paid
+        for, and every trajectory entry must match real session evidence
+        (and vice versa), so neither the budget nor the anti-repeat state
+        can be quietly dropped on restore.
+        """
+        if not isinstance(data, dict) or data.get("version") != self.BOOKKEEPING_VERSION:
+            raise Rejected("Unsupported loop bookkeeping version")
+        for key in ("max_provider_steps", "max_advance_steps"):
+            if type(data.get(key)) is not int or data[key] < 1:
+                raise Rejected(f"Invalid loop bookkeeping {key}")
+        steps = data.get("steps_used")
+        if type(steps) is not int or steps < 0 or steps > data["max_provider_steps"]:
+            raise Rejected("Invalid loop bookkeeping step count")
+        entries = data.get("trajectory")
+        if not isinstance(entries, list):
+            raise Rejected("Invalid loop bookkeeping trajectory")
+        restored = []
+        for entry in entries:
+            if (not isinstance(entry, dict)
+                    or not is_text(entry.get("request_id"))
+                    or entry.get("kind") not in {
+                        "request_diagnostic_test", "request_user_evidence"}
+                    or not is_text(entry.get("action"))
+                    or not is_text(entry.get("evidence_id"))
+                    or not is_text(entry.get("statement"))):
+                raise Rejected("Invalid loop bookkeeping trajectory")
+            observations = entry.get("observations")
+            if (not isinstance(observations, list) or not observations
+                    or any(not is_text(item) for item in observations)):
+                raise Rejected("Invalid loop bookkeeping trajectory")
+            restored.append(CompletedStep(
+                entry["request_id"], entry["kind"], entry["action"],
+                tuple(observations), entry["evidence_id"], entry["statement"],
+            ))
+        if steps < len(restored):
+            raise Rejected("Loop bookkeeping steps fall below completed requests")
+        evidence = {item.id: item for item in self._session.snapshot.evidence}
+        for step in restored:
+            linked = evidence.get(step.evidence_id)
+            if linked is None or linked.request_id != step.request_id:
+                raise Rejected("Loop bookkeeping trajectory does not match session evidence")
+        covered = {(step.request_id, step.evidence_id) for step in restored}
+        for item in self._session.snapshot.evidence:
+            if item.request_id is not None and (item.request_id, item.id) not in covered:
+                raise Rejected("Loop bookkeeping trajectory omits session evidence")
+        self._steps_used = steps
+        self._max_provider_steps = data["max_provider_steps"]
+        self._max_advance_steps = data["max_advance_steps"]
+        self._trajectory = restored
+        self._run_entry_steps = steps
+        self._reset_progress()
 
     def _result(self, outcome, snapshot, message):
         advance_steps = self._steps_used - self._run_entry_steps
@@ -218,7 +360,55 @@ class AgentLoop:
                 self._max_provider_steps - self._steps_used,
                 self._run_entry_steps + self._max_advance_steps - self._steps_used,
             ),
+            # Full answered-test history: never truncated like feedback.
+            trajectory=tuple(self._trajectory),
         )
+
+    def _reset_progress(self):
+        self._duplicates = 0
+        self._stale = 0
+
+    def _try_honest_close(self, reason):
+        """Application-originated inconclusive close; None when not applicable.
+
+        Built only from authoritative session records (evidence IDs,
+        hypothesis causes), so the handoff can never invent findings.
+        Returns None when the core refuses (e.g. wrong status) or when no
+        evidence exists to cite; the caller then continues to its budget.
+        """
+        snapshot = self._session.snapshot
+        if not snapshot.evidence:
+            return None
+        if reason == "repeat":
+            summary = (
+                "Stopped after the same answered test was requested "
+                f"{self._duplicates} more times without progress."
+            )
+        else:
+            summary = (
+                f"Stopped after {self._stale} steps without new evidence "
+                "or verification."
+            )
+        open_causes = [
+            hypothesis.cause for hypothesis in snapshot.hypotheses
+            if hypothesis.status in {H.POSSIBLE, H.SUPPORTED, H.CONFIRMED}
+        ]
+        try:
+            result = self._session.execute("declare_inconclusive", {
+                "summary": summary,
+                "checked_evidence_ids": [item.id for item in snapshot.evidence],
+                "remaining_possibilities": (
+                    "; ".join(open_causes)
+                    or "No candidate cause was established."
+                ),
+                "safe_next_steps": _SAFE_NEXT_STEPS,
+            })
+        except Rejected:
+            return None
+        self._reset_progress()
+        self._record_success("declare_inconclusive", result)
+        return self._result(
+            LoopOutcome.INCONCLUSIVE, result.session, f"Inconclusive: {summary}")
 
     @staticmethod
     def _extract_call(decision):
@@ -263,7 +453,12 @@ class AgentLoop:
 
     def _record_success(self, name, result: ActionResult):
         verification = result.verification
-        if verification is None:
+        if name == "declare_inconclusive":
+            self._record_feedback(
+                tool=name, ok=True,
+                message="Investigation declared inconclusive.",
+            )
+        elif verification is None:
             self._record_feedback(
                 tool=name, ok=True, message=f"{name} succeeded: {result.record_id}.",
                 record_id=result.record_id,
@@ -280,3 +475,80 @@ class AgentLoop:
                 message=f"Recommendation rejected by verification: {issues}.",
                 verification=verification,
             )
+
+
+_SAFE_NEXT_STEPS = (
+    "Re-check the reported results, retry with different parts or "
+    "conditions where safe, and if the device still shows no response take "
+    "it to a qualified repair technician."
+)
+
+_WORDS = re.compile(r"[a-z0-9]+")
+
+# Token overlap at or above this marks a same-kind request a near-repeat.
+# Exact normalized matches always count; genuinely distinct tests must
+# name a different action or materially different questions.
+NEAR_DUPLICATE_SIMILARITY = 0.8
+
+
+def _normalize_text(text):
+    return " ".join(_WORDS.findall(text.lower()))
+
+
+def _token_similarity(first, second):
+    if first == second:
+        return 1.0
+    union = first | second
+    if not union:
+        return 1.0
+    return len(first & second) / len(union)
+
+
+def _request_tokens(action, observations):
+    return set(_WORDS.findall((action + " " + " ".join(observations)).lower()))
+
+
+def _find_repeat(name, arguments, trajectory, pending):
+    """Describe the answered/pending request this call repeats, if any."""
+    candidates = list(trajectory)
+    if pending is not None:
+        candidates.append(pending)
+    action = arguments["action"]
+    observations = arguments.get("observations", [])
+    key = (
+        name, _normalize_text(action),
+        tuple(sorted(_normalize_text(item) for item in observations)),
+    )
+    tokens = _request_tokens(action, observations)
+    for prior in candidates:
+        prior_observations = list(prior.observations)
+        prior_key = (
+            prior.kind, _normalize_text(prior.action),
+            tuple(sorted(_normalize_text(item) for item in prior_observations)),
+        )
+        if prior_key == key:
+            return _repeat_message(prior, exact=True)
+        if prior.kind == name and _token_similarity(
+                tokens, _request_tokens(prior.action, prior_observations)
+        ) >= NEAR_DUPLICATE_SIMILARITY:
+            return _repeat_message(prior, exact=False)
+    return None
+
+
+def _repeat_message(prior, exact):
+    match = "repeats" if exact else "nearly repeats"
+    answered = getattr(prior, "evidence_id", None)
+    if answered is None:
+        detail = f"the request {prior.id} already awaiting a result"
+    else:
+        detail = f"the answered test {prior.request_id} (result {answered})"
+    return (
+        f"No progress: this request {match} {detail}. The outcome is "
+        "already recorded; propose a genuinely different diagnostic step "
+        "or declare the investigation inconclusive."
+    )
+
+
+def _report_summary(snapshot):
+    report = snapshot.inconclusive
+    return report.summary if report is not None else "no detail recorded"

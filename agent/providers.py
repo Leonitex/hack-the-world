@@ -42,6 +42,23 @@ class StepFeedback:
 
 
 @dataclass(frozen=True)
+class CompletedStep:
+    """One answered request: trusted action text linked to its real result.
+
+    Captured by the loop from core-generated InputRequests and the
+    evidence ingested for them, so the model always sees which test
+    produced which observation. Never sourced from model claims.
+    """
+
+    request_id: str
+    kind: str
+    action: str
+    observations: tuple
+    evidence_id: str
+    statement: str
+
+
+@dataclass(frozen=True)
 class ProviderRequest:
     """Everything a provider may use to choose the next tool call."""
 
@@ -52,6 +69,7 @@ class ProviderRequest:
     turn_count: int
     completion_attempts: int
     remaining_provider_steps: int
+    trajectory: tuple = ()
 
 
 class Provider:
