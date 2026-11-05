@@ -75,9 +75,25 @@ specs that run only against a server with the #9 features:
 
 Results for this branch are recorded in the stacked PR's CI runs (the
 `qa-gates.yml` workflow already watches `work/nonrepeating-diagnosis`).
-Local pre-push run (2026-11-05): 4 passed (12.0s) — smoke (2),
-repeat-guard, reopen-case — against a fixture server on system Chrome.
+Local pre-push runs (2026-11-05): 4 passed — smoke (2),
+repeat-guard, reopen-case — against a fixture server on system Chrome,
+re-run green after review fixes. Live-model runs stay manual: no
+provider key exists in the automation environment.
 The historical table above keeps PR #11's own results unchanged.
+
+## Independent review of the #9 stack (2026-11-05)
+
+Two native subagents reviewed the trust boundary and the app/E2E
+integration read-only. Verdicts: SHIP-WITH-FIXES, no Criticals. All
+must-fix items landed before push: checkpoint validator strictness
+(turn floor, exact record IDs, elimination marks, version types),
+trajectory statement cross-check, duplicate-guard containment rule,
+cross-kind exact-match blocking, NFKC folding, undecodable-checkpoint
+graceful fallback, solved-case write guard, reopen failure ordering,
+stale-view restore, status-preservation, double-solve no-op, orphan-row
+cleanup, migration column check. Deferred with documentation: checkpoint
+HMAC (trusted local storage assumption), Baseten allowlist rendering,
+error-text caps, hypothesis-churn stemming.
 
 ## Running the automated gates locally
 
