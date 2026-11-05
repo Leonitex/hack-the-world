@@ -3,6 +3,8 @@
 from dataclasses import replace
 from uuid import uuid4
 
+import re
+
 from .contracts import is_text, validate_arguments
 from .models import (
     ActionResult, Evidence, Hypothesis, HypothesisStatus as H, InconclusiveReport,
@@ -13,6 +15,13 @@ from .verification import (
 )
 
 CHECKPOINT_VERSION = 1
+
+_REQUEST_ID = re.compile(r"request(\d+)$")
+
+# Trusted local storage only: validators prove shape, reference, and budget
+# consistency, but the bundles carry no authenticity code. Anyone with write
+# access to the checkpoint store can forge shape-valid state; HMAC cover is
+# the documented follow-up if the threat model ever grows beyond one user.
 
 
 class DiagnosticSession:
@@ -257,7 +266,7 @@ def _restore_checkpoint(data):
     """Validate checkpoint data and rebuild (state, request_count, limits)."""
     if not isinstance(data, dict):
         raise Rejected("Checkpoint must be an object")
-    if data.get("version") != CHECKPOINT_VERSION:
+    if type(data.get("version")) is not int or data["version"] != CHECKPOINT_VERSION:
         raise Rejected("Unsupported checkpoint version")
     sid, problem = data.get("id"), data.get("problem")
     if not is_text(sid) or not is_text(problem):
@@ -275,11 +284,12 @@ def _restore_checkpoint(data):
         if type(data.get(key)) is not int or data[key] < 1:
             raise Rejected(f"Checkpoint {key} is invalid")
     prefix = f"{sid}:"
-    evidence = _restore_evidence(data.get("evidence"), prefix)
+    request_count = data["request_count"]
+    evidence = _restore_evidence(data.get("evidence"), prefix, request_count)
     by_id = {item.id: item for item in evidence}
     hypotheses = _restore_hypotheses(data.get("hypotheses"), prefix, by_id)
     hypothesis_ids = {item.id for item in hypotheses}
-    next_action = _restore_request(data.get("next_action"), prefix)
+    next_action = _restore_request(data.get("next_action"), prefix, request_count)
     recommendation = _restore_recommendation(
         data.get("recommendation"), by_id, hypothesis_ids)
     verifications = _restore_verifications(
@@ -301,9 +311,10 @@ def _restore_checkpoint(data):
         raise Rejected("Checkpoint pause record does not match its status")
     if data["completion_attempts"] != len(verifications):
         raise Rejected("Checkpoint completion count is inconsistent")
-    if data["turn_count"] < len(evidence):
+    floor = len(evidence) + len(hypotheses) + len(verifications) + request_count
+    if data["turn_count"] < floor:
         raise Rejected("Checkpoint turn count is inconsistent")
-    if data["request_count"] < _max_request_number(next_action, evidence, prefix):
+    if request_count < _max_request_number(next_action, evidence, prefix):
         raise Rejected("Checkpoint request counter regressed")
     state = Session(
         id=sid, problem=problem, status=status, turn_count=data["turn_count"],
@@ -325,15 +336,15 @@ def _restore_checkpoint(data):
     return state, data["request_count"], data["max_turns"], data["max_completion_attempts"]
 
 
-def _restore_evidence(items, prefix):
+def _restore_evidence(items, prefix, request_count):
     if not isinstance(items, list):
         raise Rejected("Checkpoint evidence is invalid")
     restored = []
+    seen_links = set()
     for position, item in enumerate(items, start=1):
         if not isinstance(item, dict):
             raise Rejected("Checkpoint evidence is invalid")
-        eid = item.get("id")
-        if not is_text(eid) or not eid.startswith(prefix):
+        if item.get("id") != f"{prefix}e{position}":
             raise Rejected("Checkpoint evidence id is invalid")
         if not is_text(item.get("source")) or not is_text(item.get("statement")):
             raise Rejected("Checkpoint evidence text is invalid")
@@ -346,28 +357,36 @@ def _restore_evidence(items, prefix):
         if type(item.get("order")) is not int or item["order"] != position:
             raise Rejected("Checkpoint evidence order is invalid")
         request_id = item.get("request_id")
-        if (request_id is not None
-                and (not is_text(request_id) or not request_id.startswith(prefix))):
-            raise Rejected("Checkpoint evidence link is invalid")
+        if request_id is not None:
+            if not _valid_request_id(request_id, prefix, request_count):
+                raise Rejected("Checkpoint evidence link is invalid")
+            if request_id in seen_links:
+                raise Rejected("Checkpoint evidence link repeats")
+            seen_links.add(request_id)
         restored.append(Evidence(
-            eid, item["source"], item["statement"],
+            item["id"], item["source"], item["statement"],
             tuple((key, value) for key, value in provenance),
             position, request_id,
         ))
-    if len({item.id for item in restored}) != len(restored):
-        raise Rejected("Checkpoint evidence ids repeat")
     return tuple(restored)
+
+
+def _valid_request_id(rid, prefix, request_count):
+    if not is_text(rid) or not rid.startswith(prefix):
+        return False
+    match = _REQUEST_ID.match(rid[len(prefix):])
+    return match is not None and 1 <= int(match.group(1)) <= request_count
 
 
 def _restore_hypotheses(items, prefix, by_id):
     if not isinstance(items, list):
         raise Rejected("Checkpoint hypotheses are invalid")
     restored = []
-    for item in items:
+    for position, item in enumerate(items, start=1):
         if not isinstance(item, dict):
             raise Rejected("Checkpoint hypotheses are invalid")
         hid = item.get("id")
-        if not is_text(hid) or not hid.startswith(prefix):
+        if hid != f"{prefix}h{position}":
             raise Rejected("Checkpoint hypothesis id is invalid")
         if not is_text(item.get("cause")):
             raise Rejected("Checkpoint hypothesis text is invalid")
@@ -394,7 +413,11 @@ def _restore_hypotheses(items, prefix, by_id):
                 raise Rejected("Checkpoint resolution order is invalid")
         eliminated_at = item.get("eliminated_at")
         if eliminated_at is not None and (
-                type(eliminated_at) is not int or eliminated_at < 0):
+                type(eliminated_at) is not int or eliminated_at < 0
+                or eliminated_at > len(by_id)):
+            raise Rejected("Checkpoint elimination mark is invalid")
+        if status is H.ELIMINATED and (
+                type(eliminated_at) is not int or eliminated_at > len(by_id)):
             raise Rejected("Checkpoint elimination mark is invalid")
         restored.append(Hypothesis(
             hid, item["cause"], status, supporting, contradicting,
@@ -414,13 +437,13 @@ def _restore_refs(refs, by_id, label):
     return tuple(refs)
 
 
-def _restore_request(value, prefix):
+def _restore_request(value, prefix, request_count):
     if value is None:
         return None
     if not isinstance(value, dict):
         raise Rejected("Checkpoint pending request is invalid")
     rid = value.get("id")
-    if not is_text(rid) or not rid.startswith(prefix):
+    if not _valid_request_id(rid, prefix, request_count):
         raise Rejected("Checkpoint request id is invalid")
     if value.get("kind") not in {"request_diagnostic_test", "request_user_evidence"}:
         raise Rejected("Checkpoint request kind is invalid")

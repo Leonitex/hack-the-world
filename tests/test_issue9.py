@@ -276,6 +276,82 @@ class CheckpointTests(unittest.TestCase):
         with self.assertRaises(Rejected):
             DiagnosticSession.from_checkpoint(payload)
 
+    def test_rejects_turn_count_below_record_floor(self):
+        session = DiagnosticSession(PROBLEM)
+        for index in range(5):
+            session.execute("propose_hypothesis", {"cause": f"Cause {index}."})
+        payload = session.to_checkpoint()
+        self.assertEqual(payload["turn_count"], 5)
+        payload["turn_count"] = 0
+        with self.assertRaises(Rejected):
+            DiagnosticSession.from_checkpoint(payload)
+
+    def test_rejects_malformed_record_ids(self):
+        session, _e, _h, _r = self._rich_session()
+        payload = session.to_checkpoint()
+        payload["evidence"][0]["id"] = f"{payload['id']}:x1"
+        with self.assertRaises(Rejected):
+            DiagnosticSession.from_checkpoint(payload)
+        payload = session.to_checkpoint()
+        payload["evidence"][0]["id"] = f"{payload['id']}:e9"
+        with self.assertRaises(Rejected):
+            DiagnosticSession.from_checkpoint(payload)
+        payload = session.to_checkpoint()
+        payload["hypotheses"][0]["id"] = f"{payload['id']}:y1"
+        with self.assertRaises(Rejected):
+            DiagnosticSession.from_checkpoint(payload)
+        payload = session.to_checkpoint()
+        payload["next_action"]["id"] = f"{payload['id']}:bogus"
+        with self.assertRaises(Rejected):
+            DiagnosticSession.from_checkpoint(payload)
+
+    def test_rejects_eliminated_hypothesis_without_mark(self):
+        session, evidence_id = _session_with_evidence()
+        hyp = session.execute("propose_hypothesis", {"cause": "Weak cause."})
+        session.execute("update_hypothesis", {
+            "hypothesis_id": hyp.record_id, "status": "eliminated",
+            "supporting": [], "contradicting": [evidence_id],
+            "resolutions": {}, "rationale": "Ruled out.",
+        })
+        payload = session.to_checkpoint()
+        payload["hypotheses"][0]["eliminated_at"] = None
+        with self.assertRaises(Rejected):
+            DiagnosticSession.from_checkpoint(payload)
+        payload = session.to_checkpoint()
+        payload["hypotheses"][0]["eliminated_at"] = 999
+        with self.assertRaises(Rejected):
+            DiagnosticSession.from_checkpoint(payload)
+
+    def test_reopen_gate_rejects_missing_elimination_mark(self):
+        from diagnostic_core.models import Evidence, Hypothesis, HypothesisStatus as H
+        from diagnostic_core.verification import verify_hypothesis
+        evidence = Evidence("s:e1", "user_text", "Old.", (("k", "v"),), 1, None)
+        fresh = Evidence("s:e2", "user_text", "New.", (("k", "v"),), 2, None)
+        old = Hypothesis("s:h1", "Cause.", H.ELIMINATED, (), ("s:e1",), (), "", None)
+        new = Hypothesis("s:h1", "Cause.", H.SUPPORTED, ("s:e2",), ("s:e1",), (), "R.")
+        session = DiagnosticSession(PROBLEM).snapshot
+        session = session.__class__(
+            id="s", problem=PROBLEM, evidence=(evidence, fresh),
+            hypotheses=(old,))
+        with self.assertRaises(Rejected):
+            verify_hypothesis(session, old, new)
+
+    def test_rejects_duplicate_request_links(self):
+        session, _e, _h, _r = self._rich_session()
+        payload = session.to_checkpoint()
+        linked = [item for item in payload["evidence"] if item["request_id"]]
+        self.assertTrue(linked)
+        payload["evidence"][0]["request_id"] = linked[0]["request_id"]
+        with self.assertRaises(Rejected):
+            DiagnosticSession.from_checkpoint(payload)
+
+    def test_rejects_non_integer_version(self):
+        session, _e, _h, _r = self._rich_session()
+        payload = session.to_checkpoint()
+        payload["version"] = True
+        with self.assertRaises(Rejected):
+            DiagnosticSession.from_checkpoint(payload)
+
     def test_round_trip_with_blank_rationale_hypothesis(self):
         session, _evidence_id = _session_with_evidence()
         session.execute("propose_hypothesis", {"cause": "Fresh cause."})
@@ -422,6 +498,46 @@ class DuplicateGuardTests(unittest.TestCase):
         second = loop.run()
         self.assertIs(second.outcome, LoopOutcome.NEEDS_INPUT)
         self.assertIn("known-good charger", second.session.next_action.action)
+
+    def test_padded_repeat_blocked_by_containment(self):
+        loop, _provider = _loop(script=[
+            _request_call(POWER_TEST),
+            _request_call(POWER_TEST + " Please be careful and thorough today."),
+            _request_call(CHARGER_TEST),
+        ])
+        loop.run()
+        loop.resume_with_result("Nothing happened.",
+                                {"channel": "test", "kind": "observation"})
+        second = loop.run()
+        self.assertIs(second.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertEqual(second.session.next_action.action, CHARGER_TEST)
+
+    def test_cross_kind_exact_repeat_blocked(self):
+        loop, _provider = _loop(script=[
+            _request_call(POWER_TEST),
+            ToolCall("request_user_evidence", {
+                "action": POWER_TEST, "observations": ["What happened?"]}),
+            _request_call(CHARGER_TEST),
+        ])
+        loop.run()
+        loop.resume_with_result("Nothing happened.",
+                                {"channel": "test", "kind": "observation"})
+        second = loop.run()
+        self.assertIs(second.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertEqual(second.session.next_action.action, CHARGER_TEST)
+
+    def test_homoglyph_repeat_blocked_after_normalization(self):
+        loop, _provider = _loop(script=[
+            _request_call(POWER_TEST),
+            _request_call("Ｐｒｅｓｓ and hold the power button for ten seconds."),
+            _request_call(CHARGER_TEST),
+        ])
+        loop.run()
+        loop.resume_with_result("Nothing happened.",
+                                {"channel": "test", "kind": "observation"})
+        second = loop.run()
+        self.assertIs(second.outcome, LoopOutcome.NEEDS_INPUT)
+        self.assertEqual(second.session.next_action.action, CHARGER_TEST)
 
     def test_duplicate_count_resets_after_genuine_progress(self):
         loop, _provider = _loop(script=[
@@ -598,6 +714,36 @@ class BookkeepingTests(unittest.TestCase):
         with self.assertRaises(Rejected):
             loop.apply_bookkeeping(saved)
 
+    def test_bookkeeping_rejects_non_integer_version(self):
+        loop, _provider = _loop(script=[])
+        saved = loop.capture_bookkeeping()
+        saved["version"] = True
+        with self.assertRaises(Rejected):
+            loop.apply_bookkeeping(saved)
+
+    def test_bookkeeping_rejects_statement_mismatch(self):
+        loop, _provider = _loop(script=[_request_call(POWER_TEST)])
+        loop.run()
+        loop.resume_with_result("Nothing happened.",
+                                {"channel": "test", "kind": "observation"})
+        saved = loop.capture_bookkeeping()
+        saved["trajectory"][0]["statement"] = "The device booted fine."
+        revived = AgentLoop(loop.session, FakeProvider([]))
+        with self.assertRaises(Rejected):
+            revived.apply_bookkeeping(saved)
+
+    def test_bookkeeping_rejects_duplicate_entries(self):
+        loop, _provider = _loop(script=[_request_call(POWER_TEST)])
+        loop.run()
+        loop.resume_with_result("Nothing happened.",
+                                {"channel": "test", "kind": "observation"})
+        saved = loop.capture_bookkeeping()
+        saved["trajectory"].append(dict(saved["trajectory"][0]))
+        saved["steps_used"] = 2
+        revived = AgentLoop(loop.session, FakeProvider([]))
+        with self.assertRaises(Rejected):
+            revived.apply_bookkeeping(saved)
+
 
 class _CannedBasetenResponse:
     def __init__(self, payload):
@@ -744,6 +890,22 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(session["archived"], 1)
         store.save_checkpoint("old", {"version": 1})
         self.assertEqual(store.load_checkpoint("old"), {"version": 1})
+
+    def test_migration_repairs_columns_despite_version_flag(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL,"
+            " problem TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'live',"
+            " run_token TEXT NOT NULL, created_at TEXT NOT NULL,"
+            " updated_at TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0)")
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+        conn.close()
+        store = HistoryStore(self.path)
+        store.create_session("s1", "Case 1", PROBLEM)
+        self.assertEqual(store.get_session("s1")["case_status"], "open")
+        store.set_case_status("s1", "solved", note="note")
+        self.assertEqual(store.get_session("s1")["solved_note"], "note")
 
     def test_case_status_lifecycle(self):
         store = HistoryStore(self.path)
@@ -1006,6 +1168,114 @@ class AppCaseTests(unittest.TestCase):
         blob = json.dumps(bundle).lower()
         for marker in ("api_key", "apikey", "secret", "token", "data:image"):
             self.assertNotIn(marker, blob)
+
+    def test_undecodable_checkpoint_fails_safe_on_switch_and_view(self):
+        self.start_case(script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        hid = phone_app.STATE["history_session_id"]
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE checkpoints SET payload = 'not-json{{{' WHERE session_id = ?",
+                     (hid,))
+        conn.commit()
+        conn.close()
+        self.simulate_restart()
+        switched = self.client.post(f"/case/{hid}/switch", follow_redirects=True)
+        self.assertEqual(switched.status_code, 200)
+        self.assertIn("Something needs attention", switched.get_data(as_text=True))
+        self.assertIsNone(phone_app.STATE["loop"])
+        viewed = self.client.get(f"/history/{hid}")
+        self.assertEqual(viewed.status_code, 200)
+        body = viewed.get_data(as_text=True)
+        self.assertNotIn("Resume investigation", body)
+        self.assertIn("Session started", body)
+
+    def test_solved_case_rejects_further_answers(self):
+        _, fake = self.start_case(
+            script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        hid = phone_app.STATE["history_session_id"]
+        self.client.post(f"/case/{hid}/solve", data={"note": ""}, follow_redirects=True)
+        turns = phone_app.STATE["loop"].session.snapshot.turn_count
+        fake.stage(_cause("Cause B"), _ask("Listen for fan noise."))
+        resumed = self.resume("Late answer.")
+        self.assertIn("That case is solved", resumed.get_data(as_text=True))
+        self.assertEqual(phone_app.STATE["loop"].session.snapshot.turn_count, turns)
+        retried = self.retry()
+        self.assertIn("That case is solved", retried.get_data(as_text=True))
+        self.assertNotIn('id="resumeForm"', self.client.get("/").get_data(as_text=True))
+
+    def test_reopen_run_failure_keeps_memory_and_db_agreed(self):
+        _, fake = self.start_case(script=[_cause("Dead battery.")])
+        hid = phone_app.STATE["history_session_id"]
+        evidence_id = f"{hid}:e1"
+        hypothesis_id = f"{hid}:h1"
+        fake.stage(
+            ToolCall("update_hypothesis", {
+                "hypothesis_id": hypothesis_id, "status": "supported",
+                "supporting": [evidence_id], "contradicting": [],
+                "resolutions": {}, "rationale": "No response at all.",
+            }),
+            ToolCall("submit_recommendation", {
+                "hypothesis_id": hypothesis_id, "action": "Replace the battery.",
+                "evidence_ids": [evidence_id], "acknowledged_contradictions": [],
+            }),
+        )
+        self.retry()
+        self.client.post(f"/case/{hid}/solve", data={"note": ""}, follow_redirects=True)
+        with patch.object(AgentLoop, "run", side_effect=Rejected("boom")):
+            response = self.client.post(f"/case/{hid}/reopen", data={"note": ""},
+                                        follow_redirects=True)
+        self.assertIn("reopened, but continuing failed", response.get_data(as_text=True))
+        self.assertEqual(phone_app.STATE["loop"].session.snapshot.status, S.INVESTIGATING)
+        self.assertEqual(phone_app.get_store().get_session(hid)["case_status"], "open")
+        self.assertIsNotNone(phone_app.get_store().load_checkpoint(hid))
+        self.assertIsNone(phone_app.STATE["last_result"])
+
+    def test_failed_switch_keeps_current_case_live(self):
+        self.start_case(script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        hid = phone_app.STATE["history_session_id"]
+        response = self.client.post("/case/does-not-exist/switch", follow_redirects=True)
+        self.assertIn("Something needs attention", response.get_data(as_text=True))
+        self.assertEqual(phone_app.STATE["history_session_id"], hid)
+        self.assertIsNotNone(phone_app.STATE["loop"])
+
+    def test_transient_outcome_preserves_awaiting_status(self):
+        _, fake = self.start_case(
+            script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        hid = phone_app.STATE["history_session_id"]
+        self.assertEqual(
+            phone_app.get_store().get_session(hid)["case_status"], "awaiting")
+        from agent.providers import ProviderError
+        fake.stage(ProviderError("boom"))
+        self.resume("The light is dark.")
+        self.assertEqual(
+            phone_app.STATE["last_result"].outcome, LoopOutcome.PROVIDER_ERROR)
+        self.assertEqual(
+            phone_app.get_store().get_session(hid)["case_status"], "awaiting")
+
+    def test_double_solve_is_single_audit_entry(self):
+        self.start_case(script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        hid = phone_app.STATE["history_session_id"]
+        self.client.post(f"/case/{hid}/solve", data={"note": "First note."},
+                         follow_redirects=True)
+        self.client.post(f"/case/{hid}/solve", data={"note": "Second note."},
+                         follow_redirects=True)
+        kinds = [e["title"] for e in phone_app.STATE["timeline"]]
+        self.assertEqual(kinds.count("Marked solved"), 1)
+        self.assertEqual(phone_app.get_store().get_session(hid)["solved_note"], "First note.")
+
+    def test_start_failure_removes_orphan_row_and_restores_previous(self):
+        self.start_case(script=[_cause("Cause A"), _ask("Check the indicator light.")])
+        hid_a = phone_app.STATE["history_session_id"]
+        from agent.providers import ProviderError
+        with patch.object(AgentLoop, "run", side_effect=ProviderError("boom")):
+            with patch("phone_app.create_provider",
+                       return_value=(_StagedFake([]), "Test Provider")):
+                response = self.client.post(
+                    "/start", data={"problem": "Doomed case."}, follow_redirects=True)
+        self.assertIn("Something needs attention", response.get_data(as_text=True))
+        rows = phone_app.get_store().list_sessions()
+        self.assertEqual([r["id"] for r in rows], [hid_a])
+        self.assertEqual(phone_app.STATE["history_session_id"], hid_a)
+        self.assertIsNotNone(phone_app.STATE["loop"])
 
     def test_archived_case_is_read_only_without_resume(self):
         self.start_case(script=[_cause("Cause A"), _ask("Check the indicator light.")])

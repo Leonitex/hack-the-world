@@ -2,7 +2,7 @@
 //
 // The app server must already run with the deterministic fixture:
 //   HTW_E2E_FAKE_PROVIDER=1 python phone_app.py
-// Serial workers are required: the demo server keeps one global session.
+// Serial workers are required: the specs share one demo server process.
 const { defineConfig } = require('@playwright/test');
 
 module.exports = defineConfig({

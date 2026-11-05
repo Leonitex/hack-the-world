@@ -30,6 +30,7 @@ honestly as inconclusive instead of looping forever.
 """
 
 import re
+import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
@@ -296,7 +297,8 @@ class AgentLoop:
         (and vice versa), so neither the budget nor the anti-repeat state
         can be quietly dropped on restore.
         """
-        if not isinstance(data, dict) or data.get("version") != self.BOOKKEEPING_VERSION:
+        if (not isinstance(data, dict) or type(data.get("version")) is not int
+                or data["version"] != self.BOOKKEEPING_VERSION):
             raise Rejected("Unsupported loop bookkeeping version")
         for key in ("max_provider_steps", "max_advance_steps"):
             if type(data.get(key)) is not int or data[key] < 1:
@@ -327,10 +329,17 @@ class AgentLoop:
             ))
         if steps < len(restored):
             raise Rejected("Loop bookkeeping steps fall below completed requests")
+        seen = set()
+        for step in restored:
+            key = (step.request_id, step.evidence_id)
+            if key in seen:
+                raise Rejected("Loop bookkeeping trajectory repeats a request")
+            seen.add(key)
         evidence = {item.id: item for item in self._session.snapshot.evidence}
         for step in restored:
             linked = evidence.get(step.evidence_id)
-            if linked is None or linked.request_id != step.request_id:
+            if (linked is None or linked.request_id != step.request_id
+                    or linked.statement != step.statement):
                 raise Rejected("Loop bookkeeping trajectory does not match session evidence")
         covered = {(step.request_id, step.evidence_id) for step in restored}
         for item in self._session.snapshot.evidence:
@@ -485,14 +494,25 @@ _SAFE_NEXT_STEPS = (
 
 _WORDS = re.compile(r"[a-z0-9]+")
 
-# Token overlap at or above this marks a same-kind request a near-repeat.
-# Exact normalized matches always count; genuinely distinct tests must
-# name a different action or materially different questions.
+# An exact normalized-text match always counts, even across request kinds:
+# the user cannot see the kind distinction, only the repeated question.
+# Near matches need the same kind plus token overlap: Jaccard at or above
+# NEAR_DUPLICATE_SIMILARITY, or containment at or above
+# REPEAT_CONTAINMENT with Jaccard at or above
+# REPEAT_CONTAINMENT_JACCARD_FLOOR (so padding an answered test with
+# filler words cannot evade the guard, while genuinely distinct tests
+# with small shared vocabulary still pass).
 NEAR_DUPLICATE_SIMILARITY = 0.8
+REPEAT_CONTAINMENT = 0.9
+REPEAT_CONTAINMENT_JACCARD_FLOOR = 0.6
+
+
+def _fold_text(text):
+    return unicodedata.normalize("NFKC", text).lower()
 
 
 def _normalize_text(text):
-    return " ".join(_WORDS.findall(text.lower()))
+    return " ".join(_WORDS.findall(_fold_text(text)))
 
 
 def _token_similarity(first, second):
@@ -504,34 +524,49 @@ def _token_similarity(first, second):
     return len(first & second) / len(union)
 
 
+def _token_containment(first, second):
+    if first == second:
+        return 1.0
+    smaller = min(len(first), len(second))
+    if not smaller:
+        return 1.0
+    return len(first & second) / smaller
+
+
 def _request_tokens(action, observations):
-    return set(_WORDS.findall((action + " " + " ".join(observations)).lower()))
+    return set(_WORDS.findall(_fold_text(action + " " + " ".join(observations))))
 
 
 def _find_repeat(name, arguments, trajectory, pending):
     """Describe the answered/pending request this call repeats, if any."""
     candidates = list(trajectory)
     if pending is not None:
+        # Defensive: run() returns on NEEDS_INPUT, so pending is None at the
+        # guard today; the check protects future callers that run mid-request.
         candidates.append(pending)
     action = arguments["action"]
     observations = arguments.get("observations", [])
-    key = (
-        name, _normalize_text(action),
+    text_key = (
+        _normalize_text(action),
         tuple(sorted(_normalize_text(item) for item in observations)),
     )
     tokens = _request_tokens(action, observations)
     for prior in candidates:
         prior_observations = list(prior.observations)
-        prior_key = (
-            prior.kind, _normalize_text(prior.action),
+        prior_text = (
+            _normalize_text(prior.action),
             tuple(sorted(_normalize_text(item) for item in prior_observations)),
         )
-        if prior_key == key:
+        if prior_text == text_key:
             return _repeat_message(prior, exact=True)
-        if prior.kind == name and _token_similarity(
-                tokens, _request_tokens(prior.action, prior_observations)
-        ) >= NEAR_DUPLICATE_SIMILARITY:
-            return _repeat_message(prior, exact=False)
+        if prior.kind == name:
+            prior_tokens = _request_tokens(prior.action, prior_observations)
+            similarity = _token_similarity(tokens, prior_tokens)
+            contained = _token_containment(tokens, prior_tokens)
+            if (similarity >= NEAR_DUPLICATE_SIMILARITY
+                    or (contained >= REPEAT_CONTAINMENT
+                        and similarity >= REPEAT_CONTAINMENT_JACCARD_FLOOR)):
+                return _repeat_message(prior, exact=False)
     return None
 
 

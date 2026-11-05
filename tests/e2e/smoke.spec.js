@@ -4,9 +4,9 @@
 const { test, expect } = require('@playwright/test');
 
 test.beforeEach(async ({ page }) => {
-  // The demo server holds one global session: every test loads home, waits
-  // for exactly one of the two mutually exclusive views, and resets through
-  // the real UI when a previous session is present. Each test is therefore
+  // The specs share one demo server: every test loads home, waits for
+  // exactly one of the two mutually exclusive views, and resets through
+  // the real UI when a live case is present. Each test is therefore
   // independent of file order, grep selection, or repetition.
   await page.goto('/');
   await page

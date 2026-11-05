@@ -199,7 +199,7 @@ body { line-height:1.5; }
 <header class="top"><div class="brand">Hack the World<small>Evidence-driven field diagnostics</small></div><div class="meta">{{ provider_label or "Meta Muse" }}</div></header>
 {% if error %}<div class="strip"><div class="card error" id="errorCard" tabindex="-1"><strong>Something needs attention</strong><div>{{ error }}</div></div></div>{% endif %}
 {% if advance_note %}<div class="strip"><div class="card next">{{ advance_note }}</div></div>{% endif %}
-{% if result and (result.outcome.value == "provider_error" or result.outcome.value == "advance_exhausted") %}<div class="strip"><form method="post" action="{{ url_for('retry') }}"><input type="hidden" name="case_id" value="{{ active_id }}"><button type="submit" class="secondary" style="width:100%">Try again</button></form></div>{% endif %}
+{% if result and case_status != "solved" and (result.outcome.value == "provider_error" or result.outcome.value == "advance_exhausted") %}<div class="strip"><form method="post" action="{{ url_for('retry') }}"><input type="hidden" name="case_id" value="{{ active_id }}"><button type="submit" class="secondary" style="width:100%">Try again</button></form></div>{% endif %}
 {% if viewing %}
 <div class="strip"><div class="card"><h2>{{ viewing.session.name }}</h2><div class="badges"><span class="badge">{% if viewing.session.archived %}archived · read-only{% elif viewing.session.case_status == "solved" %}solved{% elif viewing.session.case_status == "awaiting" %}awaiting result{% elif viewing.session.case_status == "inconclusive" %}inconclusive{% else %}open{% endif %}</span><span class="badge">{{ viewing.events|length }} events</span></div><div class="muted">{{ viewing.session.problem }}</div><form method="post" action="{{ url_for('rename_history', session_id=viewing.session.id) }}"><div class="rename-row"><input type="text" name="name" value="{{ viewing.session.name }}" maxlength="80" aria-label="Session name"><button type="submit" class="secondary">Rename</button></div></form>{% if can_resume %}<form method="post" action="{{ url_for('switch_case', hid=viewing.session.id) }}"><button type="submit" style="width:100%;margin-top:10px">Resume investigation</button></form>{% endif %}{% if viewing.session.case_status == "solved" and not viewing.session.archived %}<form method="post" action="{{ url_for('reopen_case', hid=viewing.session.id) }}"><button type="submit" class="secondary" style="width:100%;margin-top:10px">Reopen case</button></form>{% endif %}<div style="margin-top:10px"><a href="{{ url_for('index') }}">{% if session %}Back to live investigation{% else %}Back{% endif %}</a></div></div></div>
 <div class="strip"><div class="card"><h2>Timeline</h2>{% if viewing.events %}<ol class="timeline">{% for entry in viewing.events %}<li class="t-event"><span class="t-glyph" aria-hidden="true">{{ entry.glyph }}</span><div class="t-body"><strong>#{{ entry.seq }} · {{ entry.title }}</strong><div class="muted">{{ entry.detail }}</div><div class="muted">{{ entry.created_at[:16].replace("T", " ") }} UTC</div></div></li>{% endfor %}</ol>{% else %}<div class="muted">No events recorded yet.</div>{% endif %}</div></div>
@@ -212,7 +212,7 @@ body { line-height:1.5; }
 <section class="zone-assistant" aria-label="Assistant">
 <div class="card"><div class="badges"><span class="badge">{{ session.status }}</span><span class="badge">{{ session.turn_count }} diagnostic turns</span><span class="badge">{{ result.steps_used if result else 0 }} Muse steps</span><span class="badge">{{ result.advance_steps if result else 0 }} steps this round</span><span class="badge">{{ result.outcome.value if result else "started" }}</span></div><div class="progress"><div class="step done">Observe</div><div class="step {% if session.hypotheses %}done{% else %}active{% endif %}">Hypothesize</div><div class="step {% if session.next_action %}active{% elif session.recommendation %}done{% endif %}">Test</div><div class="step {% if session.recommendation %}done{% elif session.hypotheses and not session.next_action %}active{% endif %}">Verify</div><div class="step {% if session.recommendation %}active{% endif %}">Fix</div></div><h3>Device problem</h3><div>{{ session.problem }}</div></div>
 {{ assistant_hero() }}
-{% if session.next_action %}<div class="card next"><h2>Do this next</h2><p class="big-action"><strong>{{ session.next_action.action }}</strong></p>{% if session.next_action.observations %}<div class="muted">Report:</div><ul>{% for o in session.next_action.observations %}<li>{{ o }}</li>{% endfor %}</ul>{% endif %}<form id="resumeForm" class="composer" method="post" action="{{ url_for('resume') }}" enctype="multipart/form-data"><input type="hidden" name="case_id" value="{{ active_id }}"><label>What happened?</label><textarea id="answerInput" name="answer" required placeholder="Tell me exactly what you observed.">{{ draft_answer }}</textarea><div class="filebox" style="margin-top:10px"><input id="answerImageInput" type="file" name="image" accept="image/*" capture="environment"><small>Optional follow-up photo of what you observed.</small></div><div class="composer-row"><button type="button" id="answerMic" class="secondary" onclick="startDictation('answerInput', this)">Speak result</button><button type="submit">Submit & continue</button></div></form></div>{% endif %}
+{% if session.next_action %}<div class="card next"><h2>Do this next</h2><p class="big-action"><strong>{{ session.next_action.action }}</strong></p>{% if session.next_action.observations %}<div class="muted">Report:</div><ul>{% for o in session.next_action.observations %}<li>{{ o }}</li>{% endfor %}</ul>{% endif %}{% if case_status != "solved" %}<form id="resumeForm" class="composer" method="post" action="{{ url_for('resume') }}" enctype="multipart/form-data"><input type="hidden" name="case_id" value="{{ active_id }}"><label>What happened?</label><textarea id="answerInput" name="answer" required placeholder="Tell me exactly what you observed.">{{ draft_answer }}</textarea><div class="filebox" style="margin-top:10px"><input id="answerImageInput" type="file" name="image" accept="image/*" capture="environment"><small>Optional follow-up photo of what you observed.</small></div><div class="composer-row"><button type="button" id="answerMic" class="secondary" onclick="startDictation('answerInput', this)">Speak result</button><button type="submit">Submit & continue</button></div></form>{% endif %}</div>{% endif %}
 {% if session.recommendation %}<div class="card final"><h2>Verified recommendation</h2><p class="big-action">{{ session.recommendation.action }}</p><small>Grounded in {{ session.recommendation.evidence_ids|length }} recorded evidence item(s).</small></div>{% endif %}
 {% if session.inconclusive %}<div class="card"><h2>Inconclusive handoff</h2><p class="big-action">{{ session.inconclusive.summary }}</p><div class="muted">Checked {{ session.inconclusive.checked_evidence_ids|length }} recorded evidence item(s); this is not a verified diagnosis.</div><h3>Still possible</h3><div>{{ session.inconclusive.remaining_possibilities }}</div><h3>Safe next steps</h3><div>{{ session.inconclusive.safe_next_steps }}</div></div>{% endif %}
 {% if case_status == "solved" %}<div class="card"><h2>Case solved</h2><div class="muted">{{ solved_note or "The technician marked this case solved." }}</div><form method="post" action="{{ url_for('reopen_case', hid=active_id) }}"><button type="submit" class="secondary" style="width:100%;margin-top:10px">Reopen case</button></form></div>{% elif session %}<form method="post" action="{{ url_for('solve_case', hid=active_id) }}"><div class="rename-row"><input type="text" name="note" maxlength="200" placeholder="Repair note (optional)" aria-label="Repair note"><button type="submit" class="secondary">Mark solved</button></div></form>{% endif %}
@@ -432,7 +432,12 @@ def _save_case_checkpoint(hid):
 
 
 def _sync_case_status(hid, result):
-    """Mirror the AI outcome in the case row; never touch solved cases."""
+    """Mirror the AI outcome in the case row; never touch solved cases.
+
+    Diagnostic states map explicitly; transient provider/advance/budget
+    outcomes leave the current status alone so a retryable failure cannot
+    erase an informative state like "awaiting result".
+    """
     if result is None:
         return
     row = get_store().get_session(hid)
@@ -441,8 +446,17 @@ def _sync_case_status(hid, result):
     status = {
         LoopOutcome.NEEDS_INPUT: "awaiting",
         LoopOutcome.INCONCLUSIVE: "inconclusive",
-    }.get(result.outcome, "open")
+        LoopOutcome.COMPLETED: "open",
+        LoopOutcome.PAUSED: "open",
+    }.get(result.outcome)
+    if status is None:
+        return
     get_store().set_case_status(hid, status)
+
+
+def _case_is_solved(hid):
+    row = get_store().get_session(hid)
+    return row is not None and row["case_status"] == "solved"
 
 
 def _restore_timeline(entries):
@@ -488,7 +502,12 @@ def _restore_case(hid):
         return "Investigation not found."
     if row["archived"]:
         return "That investigation is archived and read-only."
-    bundle = store.load_checkpoint(hid)
+    try:
+        bundle = store.load_checkpoint(hid)
+    except ValueError as exc:
+        print(f"[phone_app] checkpoint undecodable for {hid}: {exc}", flush=True)
+        return ("Saved state for that investigation failed validation; "
+                "its history is preserved read-only.")
     if bundle is None:
         return ("No restorable state for that investigation; "
                 "its history is preserved read-only.")
@@ -584,6 +603,7 @@ def start():
         STATE["error"] = "Describe the device problem first."
         return redirect(url_for("index"))
     previous = STATE["history_session_id"]
+    created = None
     try:
         _park_active()
         image_data_url = image_to_data_url(request.files.get("image"))
@@ -602,6 +622,7 @@ def start():
         hid = loop.session.snapshot.id
         count = len(get_store().list_sessions()) + 1
         get_store().create_session(hid, f"Investigation {count} — {problem[:36]}", problem)
+        created = hid
         STATE["history_session_id"] = hid
         STATE["active_id"] = hid
         STATE["provider"] = provider
@@ -616,10 +637,15 @@ def start():
         _save_case_checkpoint(hid)
         _sync_case_status(hid, STATE["last_result"])
     except (ValueError, Rejected, ProviderError) as exc:
+        if created is not None:
+            get_store().delete_session(created)
+            created = None
         _restore_previous_or_clear(previous)
         _record_error(exc)
         STATE["draft_problem"] = problem
     except Exception:  # noqa: BLE001 - demo surface reports failures inline
+        if created is not None:
+            get_store().delete_session(created)
         _restore_previous_or_clear(previous)
         STATE["draft_problem"] = problem
         STATE["error"] = "Unexpected failure starting the session. Please try again."
@@ -634,6 +660,9 @@ def resume():
         return redirect(url_for("index"))
     if request.form.get("case_id") != STATE["history_session_id"]:
         STATE["error"] = "That submission belongs to a different case; nothing was changed."
+        return redirect(url_for("index"))
+    if _case_is_solved(STATE["history_session_id"]):
+        STATE["error"] = "That case is solved; reopen it to continue."
         return redirect(url_for("index"))
     answer = (request.form.get("answer") or "").strip()
     if not answer:
@@ -682,6 +711,9 @@ def retry():
     if request.form.get("case_id") != STATE["history_session_id"]:
         STATE["error"] = "That submission belongs to a different case; nothing was changed."
         return redirect(url_for("index"))
+    if _case_is_solved(STATE["history_session_id"]):
+        STATE["error"] = "That case is solved; reopen it to continue."
+        return redirect(url_for("index"))
     before = loop.session.snapshot
     try:
         # Same loop: feedback and session-wide spend carry over, so a retry
@@ -715,9 +747,10 @@ def switch_case(hid):
     STATE["error"] = None
     if hid == STATE["history_session_id"] and STATE["loop"] is not None:
         return redirect(url_for("index"))
+    previous = STATE["history_session_id"]
     failure = _live_case(hid)
     if failure is not None:
-        _clear_flats()
+        _restore_previous_or_clear(previous)
         STATE["error"] = failure
         return redirect(url_for("view_history", session_id=hid))
     return redirect(url_for("index"))
@@ -730,10 +763,13 @@ def solve_case(hid):
     if row is None or row["archived"]:
         STATE["error"] = "Investigation not found."
         return redirect(url_for("index"))
-    if hid != STATE["history_session_id"] or STATE["loop"] is None:
+    if row["case_status"] == "solved":
+        return redirect(url_for("index"))
+    previous = STATE["history_session_id"]
+    if hid != previous or STATE["loop"] is None:
         failure = _live_case(hid)
         if failure is not None:
-            _clear_flats()
+            _restore_previous_or_clear(previous)
             STATE["error"] = failure
             return redirect(url_for("view_history", session_id=hid))
     note = (request.form.get("note") or "").strip()
@@ -752,10 +788,11 @@ def reopen_case(hid):
     if row is None or row["archived"]:
         STATE["error"] = "Investigation not found."
         return redirect(url_for("index"))
-    if hid != STATE["history_session_id"] or STATE["loop"] is None:
+    previous = STATE["history_session_id"]
+    if hid != previous or STATE["loop"] is None:
         failure = _live_case(hid)
         if failure is not None:
-            _clear_flats()
+            _restore_previous_or_clear(previous)
             STATE["error"] = failure
             return redirect(url_for("view_history", session_id=hid))
     note = (request.form.get("note") or "").strip() or "Technician reopened the case."
@@ -765,8 +802,20 @@ def reopen_case(hid):
         if before.status in (S.COMPLETED, S.INCONCLUSIVE):
             loop.session.execute("reopen_investigation", {"reason": note})
             _append_entry("case", "○", "Case reopened", note)
+            get_store().set_case_status(hid, "open")
+            _park_active()
+            _save_case_checkpoint(hid)
             mid = loop.session.snapshot
-            STATE["last_result"] = loop.run()
+            try:
+                STATE["last_result"] = loop.run()
+            except Exception as exc:  # noqa: BLE001 - reopen already persisted
+                print(f"[phone_app] reopen run failed for {hid}: {exc}", flush=True)
+                STATE["last_result"] = None
+                STATE["error"] = (
+                    "The case was reopened, but continuing failed. Please try again.")
+                _park_active()
+                _save_case_checkpoint(hid)
+                return redirect(url_for("index"))
             STATE["error"] = _outcome_error(STATE["last_result"])
             _record_timeline(mid, loop.session.snapshot)
         else:
@@ -791,9 +840,11 @@ def view_history(session_id):
     context = current_context()
     context["viewing"] = {
         "session": session, "events": get_store().get_events(session_id)}
-    context["can_resume"] = (
-        not session["archived"] and get_store().load_checkpoint(session_id) is not None
-    )
+    try:
+        checkpoint = get_store().load_checkpoint(session_id)
+    except ValueError:
+        checkpoint = "corrupt"
+    context["can_resume"] = not session["archived"] and checkpoint not in (None, "corrupt")
     return render_template_string(PAGE, **context)
 
 

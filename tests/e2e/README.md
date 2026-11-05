@@ -52,11 +52,17 @@ server runs on another host or port.
 
 ## Constraints (read before extending)
 
-- Workers are serial (`workers: 1`): the demo server holds one global
-  session, so parallel tests would corrupt each other's state.
+- Workers are serial (`workers: 1`): the demo server is shared state,
+  so parallel tests would corrupt each other's cases.
 - A shared `beforeEach` resets through the UI ("Start a new
-  investigation") before each test; never assume a fresh session, since
-  each test leaves the global session behind.
+  investigation") before each test; never assume a fresh server, since
+  each test leaves its cases behind.
+- Re-runs need a wiped database plus a server restart (`rm
+  data/history.db`, then restart the fixture server); otherwise earlier
+  cases with the same problem text break strict-mode selectors.
+- Never restart the server mid-run: the fixture scripts are exact-fit
+  per case, so a restart replays them against restored state. Restart
+  recovery is proven by the Python suite (`AppCaseTests`), not here.
 - Never run these specs against a server with live keys: the assertions
   expect the exact fixture script from `agent/factory.py:e2e_script`.
 - Voice, microphone, camera, and physical-device behavior are manual

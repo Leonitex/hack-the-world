@@ -40,6 +40,8 @@ def verify_hypothesis(session, old, new):
     if new.status == H.CONFIRMED and unresolved:
         raise Rejected("Unresolved contradictions prevent confirmation")
     if old.status == H.ELIMINATED and new.status == H.SUPPORTED:
+        if old.eliminated_at is None:
+            raise Rejected("Elimination mark is missing")
         later = {e.id for e in session.evidence if e.order > old.eliminated_at}
         if not (set(new.supporting) - set(old.supporting)) & later:
             raise Rejected("Reopening requires new support recorded after elimination")

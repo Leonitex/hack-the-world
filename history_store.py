@@ -84,9 +84,8 @@ class HistoryStore:
 
     @staticmethod
     def _migrate(conn):
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version >= SCHEMA_VERSION:
-            return
+        # Column presence decides, not the version flag alone: a hand-built
+        # database could claim a newer version while missing the columns.
         columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
         if "case_status" not in columns:
             conn.execute(
@@ -94,7 +93,16 @@ class HistoryStore:
         if "solved_note" not in columns:
             conn.execute(
                 "ALTER TABLE sessions ADD COLUMN solved_note TEXT NOT NULL DEFAULT ''")
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def delete_session(self, session_id):
+        """Remove a session row with its events and checkpoint, if any."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM events WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM checkpoints WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
 
     @property
     def path(self):
