@@ -1,0 +1,12 @@
+{
+  "name": "htw-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Deterministic browser end-to-end tests for Hack the World (fake provider only).",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1"
+  }
+}
